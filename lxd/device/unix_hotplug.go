@@ -214,6 +214,21 @@ func (d *unixHotplug) Start() (*deviceConfig.RunConfig, error) {
 			}
 		}
 
+		action := "add"
+		devpath := device.Devpath()
+		subsystem := device.Subsystem()
+		sysattrs := strings.Split(device.SysattrValue("uevent"), "\n")
+
+		preamble := []string{action + "@" + devpath, "ACTION=" + action, "DEVPATH=" + devpath, "SUBSYSTEM=" + subsystem}
+		ueventParts := make([]string, 0, len(preamble)+len(sysattrs))
+		ueventParts = append(ueventParts, preamble...)
+		for _, sysattr := range sysattrs {
+			if sysattr != "" {
+				ueventParts = append(ueventParts, sysattr)
+			}
+		}
+		runConf.Uevents = append(runConf.Uevents, ueventParts)
+
 		// Remove unix device on failure to setup device.
 		runConf.Revert = func() { _ = unixDeviceRemove(d.inst.DevicesPath(), "unix", d.name, "", &runConf) }
 

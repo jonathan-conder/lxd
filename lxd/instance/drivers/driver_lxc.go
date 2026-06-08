@@ -1398,6 +1398,30 @@ func (d *lxc) deviceStart(dev device.Device, instanceRunning bool) (*deviceConfi
 			if err != nil {
 				return nil, err
 			}
+
+			// Generate uevent inside container if requested.
+			if len(runConf.Uevents) > 0 {
+				pidFdNr, pidFd := d.inheritInitPidFd()
+				if pidFdNr >= 0 {
+					defer func() { _ = pidFd.Close() }()
+				}
+
+				for _, eventParts := range runConf.Uevents {
+					ueventArray := make([]string, 0, 6+len(eventParts))
+					ueventArray = append(ueventArray, "forkuevent", "inject", "--", strconv.Itoa(d.InitPID()), strconv.Itoa(pidFdNr))
+					length := 0
+					for _, part := range eventParts {
+						length = length + len(part) + 1
+					}
+
+					ueventArray = append(ueventArray, strconv.Itoa(length))
+					ueventArray = append(ueventArray, eventParts...)
+					_, _, err := shared.RunCommandSplit(context.TODO(), nil, []*os.File{pidFd}, d.state.OS.ExecPath, ueventArray...)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 
