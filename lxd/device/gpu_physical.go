@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jochenvg/go-udev"
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/lxd/device/cdi"
@@ -209,6 +210,23 @@ func (d *gpuPhysical) startCDIDevices(configDevices cdi.ConfigDevices, runConf *
 		if err != nil {
 			return err
 		}
+
+		u := udev.Udev{}
+		device := u.NewDeviceFromDevnum('c', udev.MkDev(int(major), int(minor)))
+		action := "add"
+		devpath := device.Devpath()
+		subsystem := device.Subsystem()
+		sysattrs := strings.Split(device.SysattrValue("uevent"), "\n")
+
+		preamble := []string{action + "@" + devpath, "ACTION=" + action, "DEVPATH=" + devpath, "SUBSYSTEM=" + subsystem}
+		ueventParts := make([]string, 0, len(preamble)+len(sysattrs))
+		ueventParts = append(ueventParts, preamble...)
+		for _, sysattr := range sysattrs {
+			if sysattr != "" {
+				ueventParts = append(ueventParts, sysattr)
+			}
+		}
+		runConf.Uevents = append(runConf.Uevents, ueventParts)
 	}
 
 	// Create the devices directory if missing.
