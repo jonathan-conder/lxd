@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${fileDirname}"
+        },
+        {
+            "name": "Attach to LXD",
+            "type": "go",
+            "request": "attach",
+            "mode": "local",
+            "processId": "${command:pickProcess}",
+            "asRoot": true,
+            "console": "integratedTerminal",
+            "substitutePath": [
+                {
+                    "from": "${workspaceFolder}",
+                    "to": "/project"
+                },
+                {
+                    "from": "/snap/go/current",
+                    "to": "/var/lib/workshop/sdk/go"
+                }
+            ]
+        }
+    ]
+}

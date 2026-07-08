@@ -29,3 +29,12 @@ pkgs=(
 
 apt-get update
 apt-get install -y --no-install-recommends "${pkgs[@]}"
+
+cat <<'EOF' >>/home/workshop/.profile
+
+export CGO_CFLAGS="-I/home/workshop/go/deps/dqlite/include/ -I/home/workshop/go/deps/liblxc/include/"
+export CGO_LDFLAGS="-L/home/workshop/go/deps/dqlite/.libs/ -L/home/workshop/go/deps/liblxc/lib/x86_64-linux-gnu/"
+export LD_LIBRARY_PATH="/home/workshop/go/deps/dqlite/.libs/:/home/workshop/go/deps/liblxc/lib/x86_64-linux-gnu/"
+export PKG_CONFIG_PATH="/home/workshop/go/deps/liblxc/lib/x86_64-linux-gnu/pkgconfig"
+export CGO_LDFLAGS_ALLOW="(-Wl,-wrap,pthread_create)|(-Wl,-z,now)"
+EOF

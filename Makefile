@@ -381,6 +381,14 @@ endif
 	CGO_ENABLED=0 go install -v -trimpath -tags "agent,netgo,logdebug" ./lxd-agent
 	@echo "LXD built successfully"
 
+.PHONY: lxd-debug
+lxd-debug:
+	workshop exec lxd make DEBUG='-gcflags="all=-N -l"' debug
+	workshop exec lxd cp /home/workshop/go/bin/lxd lxd.debug
+	sudo snap stop lxd.daemon
+	sudo cp lxd.debug /var/snap/lxd/common/
+	sudo snap start lxd.daemon
+
 .PHONY: check
 check: default check-gomin check-unit test-binaries
 	cd test && ./main.sh
