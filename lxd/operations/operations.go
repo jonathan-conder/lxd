@@ -1172,6 +1172,10 @@ func (op *Operation) updateProgress(action string, data ioprogress.ProgressData)
 		progress["processed"] = strconv.FormatInt(data.TransferredBytes, 10)
 	}
 
+	if data.TotalBytes > 0 {
+		progress["total"] = strconv.FormatInt(data.TotalBytes, 10)
+	}
+
 	if data.Percentage > 0 {
 		progress["percent"] = strconv.Itoa(data.Percentage)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/cancel"
 	"github.com/canonical/lxd/shared/entity"
+	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
 )
 
@@ -146,4 +147,16 @@ func (s *operationsSuite) Test_deleteInternalParentWithChildren() {
 	s.ErrorIs(op1Child.finished.Err(), context.Canceled)
 	s.False(op2.readonly.Load())
 	s.NoError(op2.finished.Err())
+}
+
+func (s *operationsSuite) TestProgressHandler() {
+	op := newTestOp(s.Require())
+
+	op.ProgressHandler("download")(ioprogress.ProgressData{Text: "50%", Percentage: 50, TransferredBytes: 512, TotalBytes: 1024})
+	s.Equal(map[string]string{"stage": "download", "processed": "512", "total": "1024", "percent": "50"}, op.Metadata()["progress"])
+	s.Equal("50%", op.Metadata()["download_progress"])
+
+	op.ProgressHandler("unpack")(ioprogress.ProgressData{Text: "512B", TransferredBytes: 512})
+	s.Equal(map[string]string{"stage": "unpack", "processed": "512"}, op.Metadata()["progress"])
+	s.NotContains(op.Metadata(), "download_progress")
 }
