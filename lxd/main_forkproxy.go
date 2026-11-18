@@ -1000,7 +1000,7 @@ func runVMHostProxy(client *http.Client, listenAddr *deviceConfig.ProxyAddress, 
 					values := url.Values{
 						"mode":    {"connect"},
 						"address": {connectAddress},
-						"framed":  {strconv.FormatBool(listenAddr.ConnType == "udp")},
+						"framed":  {"true"},
 					}
 
 					return vmAgentProxyConn(client, values, "lxd-proxy-connect")
@@ -1034,7 +1034,7 @@ func runVMHostProxy(client *http.Client, listenAddr *deviceConfig.ProxyAddress, 
 			}
 		}
 
-		acceptVMHostConnections(client, listener, proxyConfigAddress(connectAddr, proxyConnectIndex(connectAddr, i)), false, proxyProtocol)
+		acceptVMHostConnections(client, listener, proxyConfigAddress(connectAddr, proxyConnectIndex(connectAddr, i)), proxyProtocol)
 	}
 
 	revert = false
@@ -1082,7 +1082,7 @@ func vmSetUnixSocketPermissions(path string, mode string, uid string, gid string
 	return nil
 }
 
-func acceptVMHostConnections(client *http.Client, listener net.Listener, connectAddress string, framed bool, proxyProtocol bool) {
+func acceptVMHostConnections(client *http.Client, listener net.Listener, connectAddress string, proxyProtocol bool) {
 	go func() {
 		for {
 			srcConn, err := listener.Accept()
@@ -1094,7 +1094,6 @@ func acceptVMHostConnections(client *http.Client, listener net.Listener, connect
 				values := url.Values{
 					"mode":    {"connect"},
 					"address": {connectAddress},
-					"framed":  {strconv.FormatBool(framed)},
 				}
 				dstConn, err := vmAgentProxyConn(client, values, "lxd-proxy-connect")
 				if err != nil {
