@@ -192,7 +192,7 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 		return err
 	}
 
-	if (listenAddr.ConnType != "unix" && len(connectAddr.Ports) > len(listenAddr.Ports)) || (listenAddr.ConnType == "unix" && len(connectAddr.Ports) > 1) {
+	if (listenAddr.ConnType != "unix" && len(connectAddr.Ports) > 1 && len(connectAddr.Ports) != len(listenAddr.Ports)) || (listenAddr.ConnType == "unix" && len(connectAddr.Ports) > 1) {
 		// Cannot support single address (or port) -> multiple port.
 		return errors.New("Mismatch between listen port(s) and connect port(s) count")
 	}
