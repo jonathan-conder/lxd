@@ -3,7 +3,6 @@ package apparmor
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -104,7 +103,7 @@ func TestForkproxyProfileVMUnixSockets(t *testing.T) {
 
 			allowed := `"` + shared.HostPath(test.allowed) + `" rw,`
 			denied := `"` + shared.HostPath(test.denied) + `" rw,`
-			require.True(t, strings.Contains(profile, allowed), profile)
+			require.Contains(t, profile, allowed)
 			require.NotContains(t, profile, denied)
 		})
 	}

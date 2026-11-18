@@ -411,7 +411,8 @@ func TestRelayCopyError(t *testing.T) {
 				resetPeer = rightPeer
 			}
 
-			tcpPeer := resetPeer.(*net.TCPConn)
+			tcpPeer, ok := resetPeer.(*net.TCPConn)
+			require.True(t, ok)
 			require.NoError(t, tcpPeer.SetLinger(0))
 			require.NoError(t, tcpPeer.Close())
 
@@ -449,7 +450,8 @@ func TestUnixRelayClosesRightsOnError(t *testing.T) {
 	leftProxy, leftPeer := testStreamPair(t, "unix")
 	rightProxy, rightPeer := testStreamPair(t, "unix")
 
-	leftUnix := leftPeer.(*net.UnixConn)
+	leftUnix, ok := leftPeer.(*net.UnixConn)
+	require.True(t, ok)
 	_ = rightPeer.Close()
 
 	file, err := os.CreateTemp(t.TempDir(), "rights")
