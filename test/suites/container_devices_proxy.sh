@@ -566,7 +566,8 @@ container_devices_proxy_vm() {
   socat unix-listen:"${HOST_SOCK}",unlink-early exec:/bin/cat &
   HOST_SERVER_PID=$!
   lxc config device add "${VM_NAME}" proxyDev proxy listen=unix:/tmp/lxd-proxy-vm-client.sock connect=unix:"${HOST_SOCK}" bind=instance nat=false
-  sleep 0.2
+  lxc exec "${VM_NAME}" -- systemctl restart --no-block lxd-agent.service || true
+  waitInstanceReady "${VM_NAME}"
 
   ECHO=$(lxc exec "${VM_NAME}" -- python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect('/tmp/lxd-proxy-vm-client.sock'); s.sendall(b'${MESSAGE}'); s.shutdown(socket.SHUT_WR); sys.stdout.buffer.write(b''.join(iter(lambda: s.recv(4096), b'')))")
   kill "${HOST_SERVER_PID}" 2>/dev/null || true
