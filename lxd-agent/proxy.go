@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/response"
@@ -106,15 +107,112 @@ func proxyListenUDP(addr *deviceConfig.ProxyAddress) (*net.UDPConn, error) {
 	return net.ListenUDP("udp", udpAddr)
 }
 
-func proxyListen(addr *deviceConfig.ProxyAddress, mode string, uid string, gid string) (net.Listener, error) {
-	if addr.ConnType == "unix" && !addr.Abstract {
-		err := os.Remove(addr.Address)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
+type ownedUnixListener struct {
+	net.Listener
+	path string
+	info os.FileInfo
+}
+
+var proxyUnixListenerMu sync.Mutex
+
+func (l *ownedUnixListener) Close() error {
+	proxyUnixListenerMu.Lock()
+	defer proxyUnixListenerMu.Unlock()
+
+	closeErr := l.Listener.Close()
+
+	info, err := os.Lstat(l.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return closeErr
 		}
+
+		return errors.Join(closeErr, err)
 	}
 
-	listener, err := net.Listen(addr.ConnType, proxyAddress(addr, 0))
+	if !os.SameFile(l.info, info) {
+		return closeErr
+	}
+
+	err = os.Remove(l.path)
+	if err != nil {
+		return errors.Join(closeErr, err)
+	}
+
+	return closeErr
+}
+
+func proxyListenUnix(path string) (net.Listener, error) {
+	proxyUnixListenerMu.Lock()
+	defer proxyUnixListenerMu.Unlock()
+
+	listener, err := net.Listen("unix", path)
+	if err == nil {
+		return ownUnixListener(path, listener)
+	}
+
+	if !errors.Is(err, unix.EADDRINUSE) {
+		return nil, err
+	}
+
+	conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	if !errors.Is(dialErr, unix.ECONNREFUSED) {
+		return nil, err
+	}
+
+	err = os.Remove(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	return proxyListenUnixLocked(path)
+}
+
+func proxyListenUnixLocked(path string) (net.Listener, error) {
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+
+	return ownUnixListener(path, listener)
+}
+
+func ownUnixListener(path string, listener net.Listener) (net.Listener, error) {
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		_ = listener.Close()
+		return nil, errors.New("Unix listener has an invalid type")
+	}
+
+	unixListener.SetUnlinkOnClose(false)
+	info, err := os.Lstat(path)
+	if err != nil {
+		_ = listener.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
+
+	return &ownedUnixListener{
+		Listener: listener,
+		path:     path,
+		info:     info,
+	}, nil
+}
+
+func proxyListen(addr *deviceConfig.ProxyAddress, mode string, uid string, gid string) (net.Listener, error) {
+	var listener net.Listener
+	var err error
+	if addr.ConnType == "unix" && !addr.Abstract {
+		listener, err = proxyListenUnix(addr.Address)
+	} else {
+		listener, err = net.Listen(addr.ConnType, proxyAddress(addr, 0))
+	}
+
 	if err != nil {
 		return nil, err
 	}

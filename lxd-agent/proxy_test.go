@@ -3,10 +3,14 @@ package main
 import (
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 )
 
 func TestRelayProxyConnectionsHalfClose(t *testing.T) {
@@ -66,4 +70,60 @@ func TestRelayProxyConnectionsHalfClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Relay did not stop after both sides closed")
 	}
+}
+
+func TestProxyUnixListenerOwnership(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.sock")
+	addr := &deviceConfig.ProxyAddress{
+		ConnType: "unix",
+		Address:  path,
+	}
+
+	original, err := proxyListen(addr, "", "", "")
+	require.NoError(t, err)
+
+	_, err = proxyListen(addr, "", "", "")
+	require.Error(t, err)
+	require.FileExists(t, path)
+
+	require.NoError(t, os.Remove(path))
+	replacement, err := net.Listen("unix", path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = replacement.Close() })
+
+	require.NoError(t, original.Close())
+
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+}
+
+func TestProxyUnixListenerOperationsAreSerialized(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.sock")
+	addr := &deviceConfig.ProxyAddress{
+		ConnType: "unix",
+		Address:  path,
+	}
+
+	listener, err := proxyListen(addr, "", "", "")
+	require.NoError(t, err)
+
+	proxyUnixListenerMu.Lock()
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- listener.Close()
+	}()
+	<-closeStarted
+
+	select {
+	case err := <-closeDone:
+		proxyUnixListenerMu.Unlock()
+		require.Fail(t, "Listener close was not serialized", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	proxyUnixListenerMu.Unlock()
+	require.NoError(t, <-closeDone)
 }
