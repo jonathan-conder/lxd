@@ -470,7 +470,8 @@ container_devices_proxy_tcp_unix() {
   lxc config device add proxyTester proxyDev proxy listen=tcp:127.0.0.1:4321 connect=unix:"${HOST_SOCK}" bind=instance
   sleep 0.2
 
-  ECHO=$(echo "${MESSAGE}" | lxc exec proxyTester -- socat - tcp4:127.0.0.1:4321,shut-down)
+  PID=$(lxc query /1.0/instances/proxyTester/state | jq --exit-status .pid)
+  ECHO=$(echo "${MESSAGE}" | nsenter -n -U -t "${PID}" -- socat - tcp4:127.0.0.1:4321,shut-down)
   kill "${NSENTER_PID}" 2>/dev/null || true
   wait "${NSENTER_PID}" 2>/dev/null || true
 
