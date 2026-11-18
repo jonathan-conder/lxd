@@ -34,6 +34,7 @@ var api10 = []APIEndpoint{
 	operationCmd,
 	operationWebsocket,
 	operationWait,
+	proxyCmd,
 	sftpCmd,
 	stateCmd,
 }
