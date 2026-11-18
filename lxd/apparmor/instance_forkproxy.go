@@ -124,6 +124,7 @@ func forkproxyProfile(inst instance, dev device) (string, error) {
 
 	// Add any socket used by forkproxy.
 	sockets := []string{}
+	isVM := inst.Type() == instancetype.VM
 
 	fields := strings.SplitN(dev.Config()["listen"], ":", 2)
 	if fields[0] == "unix" && !strings.HasPrefix(fields[1], "@") {
@@ -135,16 +136,16 @@ func forkproxyProfile(inst instance, dev device) (string, error) {
 				// AppArmor can get confused on Ubuntu Core so allow both paths.
 				sockets = append(sockets, fields[1])
 			}
-		} else {
+		} else if !isVM {
 			sockets = append(sockets, fields[1])
 		}
 	}
 
 	fields = strings.SplitN(dev.Config()["connect"], ":", 2)
 	if fields[0] == "unix" && !strings.HasPrefix(fields[1], "@") {
-		if dev.Config()["bind"] == "host" || dev.Config()["bind"] == "" {
+		if (dev.Config()["bind"] == "host" || dev.Config()["bind"] == "") && !isVM {
 			sockets = append(sockets, fields[1])
-		} else {
+		} else if dev.Config()["bind"] != "host" && dev.Config()["bind"] != "" {
 			hostPath := shared.HostPath(fields[1])
 			sockets = append(sockets, hostPath)
 
@@ -181,7 +182,7 @@ func forkproxyProfile(inst instance, dev device) (string, error) {
 	agentCertPath := ""
 	clientCertPath := ""
 	clientKeyPath := ""
-	if inst.Type() == instancetype.VM {
+	if isVM {
 		agentCertPath, err = filepath.EvalSymlinks(filepath.Join(inst.Path(), "agent.crt"))
 		if err != nil {
 			return "", err
