@@ -819,17 +819,21 @@ func proxyCopy(dst net.Conn, src net.Conn) error {
 	return err
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func genericRelay(dst net.Conn, src net.Conn) {
-	// relayer is a helper function that handles one-way data copying and signals completion through the provided channel
 	relayer := func(src net.Conn, dst net.Conn, ch chan error) {
 		err := proxyCopy(src, dst)
-		// Support half-closed TCP connections after copying completes. This allows data to still be received.
-		tcpConn, ok := src.(*net.TCPConn)
+
+		// The copy reads from dst and writes to src. Half-close the write
+		// side of src without closing the opposite connection.
+		conn, ok := src.(closeWriter)
 		if ok {
-			_ = tcpConn.CloseWrite()
+			_ = conn.CloseWrite()
 		}
 
-		// Signal completion
 		ch <- err
 		close(ch)
 	}
@@ -837,34 +841,33 @@ func genericRelay(dst net.Conn, src net.Conn) {
 	chSend := make(chan error)
 	chRecv := make(chan error)
 
-	// Start copying in both directions
 	go relayer(src, dst, chRecv)
 
 	_, isUDP := dst.(*net.UDPConn)
 	if !isUDP {
-		go relayer(dst, src, chSend) // Bidirectional copying is only supported for non-UDP connections
+		go relayer(dst, src, chSend)
+	} else {
+		// proxyCopy starts the reply reader for each UDP session.
+		chSend = nil
 	}
 
-	// Wait for both copy operations to complete
+	// A clean EOF completes only one direction; wait for the other direction.
 	for chSend != nil || chRecv != nil {
 		select {
 		case errSend := <-chSend:
 			if daemon.Debug && errSend != nil {
 				fmt.Printf("Warning: Error while sending data: %v\n", errSend)
 			}
-
-			chSend = nil // Sending complete
+			chSend = nil
 
 		case errRecv := <-chRecv:
 			if daemon.Debug && errRecv != nil {
 				fmt.Printf("Warning: Error while reading data: %v\n", errRecv)
 			}
-
-			chRecv = nil // Receiving complete
+			chRecv = nil
 		}
 	}
 
-	// Fully close both connections once both directions are complete
 	_ = src.Close()
 	_ = dst.Close()
 }
@@ -878,12 +881,25 @@ func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan error) {
 	readAgain:
 		sData, sOob, _, _, err := src.ReadMsgUnix(dataBuf, oobBuf)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				_ = dst.CloseWrite()
+				ch <- nil
+				return
+			}
+
 			errno, ok := shared.GetErrno(err)
 			if ok && errno == unix.EAGAIN {
 				goto readAgain
 			}
 
 			ch <- err
+			return
+		}
+
+		// ReadMsgUnix can report an orderly stream shutdown as an empty read.
+		if sData == 0 && sOob == 0 {
+			_ = dst.CloseWrite()
+			ch <- nil
 			return
 		}
 
@@ -940,24 +956,33 @@ func unixRelay(dst io.ReadWriteCloser, src io.ReadWriteCloser) {
 	chRecv := make(chan error)
 	go unixRelayer(src.(*net.UnixConn), dst.(*net.UnixConn), chRecv)
 
-	select {
-	case errSnd := <-chSend:
-		if daemon.Debug && errSnd != nil {
-			fmt.Printf("Warning: Error while sending data: %v\n", errSnd)
-		}
+	// A clean EOF completes only one direction; errors still terminate both.
+	for chSend != nil || chRecv != nil {
+		select {
+		case errSnd := <-chSend:
+			if daemon.Debug && errSnd != nil {
+				fmt.Printf("Warning: Error while sending data: %v\n", errSnd)
+			}
+			if errSnd != nil {
+				_ = src.Close()
+				_ = dst.Close()
+			}
+			chSend = nil
 
-	case errRcv := <-chRecv:
-		if daemon.Debug && errRcv != nil {
-			fmt.Printf("Warning: Error while reading data: %v\n", errRcv)
+		case errRcv := <-chRecv:
+			if daemon.Debug && errRcv != nil {
+				fmt.Printf("Warning: Error while reading data: %v\n", errRcv)
+			}
+			if errRcv != nil {
+				_ = src.Close()
+				_ = dst.Close()
+			}
+			chRecv = nil
 		}
 	}
 
 	_ = src.Close()
 	_ = dst.Close()
-
-	// Empty the channels
-	<-chSend //nolint:errcheck
-	<-chRecv //nolint:errcheck
 }
 
 func tryListen(protocol string, addr string) (net.Listener, error) {

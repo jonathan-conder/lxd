@@ -1,8 +1,12 @@
 package main
 
 import (
+	"io"
 	"log"
+	"net"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -188,5 +192,108 @@ func TestParseAddr(t *testing.T) {
 
 		require.NoError(t, err)
 		require.Equal(t, tt.expected, addr)
+	}
+}
+
+func testStreamPair(t *testing.T, network string) (proxy net.Conn, peer net.Conn) {
+	t.Helper()
+
+	switch network {
+	case "tcp":
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = listener.Close() })
+
+		client, err := net.Dial("tcp4", listener.Addr().String())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = client.Close() })
+
+		server, err := listener.Accept()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = server.Close() })
+
+		return server, client
+	case "unix":
+		address := filepath.Join(t.TempDir(), "proxy.sock")
+		listener, err := net.Listen("unix", address)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = listener.Close() })
+
+		client, err := net.Dial("unix", address)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = client.Close() })
+
+		server, err := listener.Accept()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = server.Close() })
+
+		return server, client
+	default:
+		t.Fatalf("Unknown network %q", network)
+		return nil, nil
+	}
+}
+
+func TestRelayHalfClose(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{name: "TCP to TCP", left: "tcp", right: "tcp"},
+		{name: "TCP to Unix", left: "tcp", right: "unix"},
+		{name: "Unix to TCP", left: "unix", right: "tcp"},
+		{name: "Unix to Unix", left: "unix", right: "unix"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			leftProxy, leftPeer := testStreamPair(t, test.left)
+			rightProxy, rightPeer := testStreamPair(t, test.right)
+			deadline := time.Now().Add(5 * time.Second)
+			require.NoError(t, leftPeer.SetDeadline(deadline))
+			require.NoError(t, rightPeer.SetDeadline(deadline))
+
+			relayDone := make(chan struct{})
+			go func() {
+				if test.left == "unix" && test.right == "unix" {
+					unixRelay(leftProxy, rightProxy)
+				} else {
+					genericRelay(leftProxy, rightProxy)
+				}
+
+				close(relayDone)
+			}()
+
+			_, err := leftPeer.Write([]byte("request"))
+			require.NoError(t, err)
+
+			leftWriter, ok := leftPeer.(closeWriter)
+			require.True(t, ok)
+			err = leftWriter.CloseWrite()
+			require.NoError(t, err)
+
+			request, err := io.ReadAll(rightPeer)
+			require.NoError(t, err)
+			require.Equal(t, "request", string(request))
+
+			_, err = rightPeer.Write([]byte("response"))
+			require.NoError(t, err)
+
+			rightWriter, ok := rightPeer.(closeWriter)
+			require.True(t, ok)
+			err = rightWriter.CloseWrite()
+			require.NoError(t, err)
+
+			response, err := io.ReadAll(leftPeer)
+			require.NoError(t, err)
+			require.Equal(t, "response", string(response))
+
+			select {
+			case <-relayDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Relay did not stop after both sides closed")
+			}
+		})
 	}
 }
