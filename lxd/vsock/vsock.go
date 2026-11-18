@@ -17,6 +17,11 @@ func Dial(cid, port uint32) (net.Conn, error) {
 	return vsock.Dial(cid, port, nil)
 }
 
+// DialContext connects to a remote vsock using the supplied context.
+func DialContext(ctx context.Context, cid, port uint32) (net.Conn, error) {
+	return vsock.DialContext(ctx, cid, port, nil)
+}
+
 // HTTPClient provides an HTTP client for using over vsock.
 func HTTPClient(vsockID uint32, port int, tlsClientCert string, tlsClientKey string, tlsServerCert string) (*http.Client, error) {
 	client := &http.Client{}
@@ -30,13 +35,13 @@ func HTTPClient(vsockID uint32, port int, tlsClientCert string, tlsClientKey str
 	client.Transport = &http.Transport{
 		TLSClientConfig: tlsConfig,
 		// Setup a VM socket dialer.
-		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			var conn net.Conn
 			var err error
 
 			// Retry for up to 1s at 100ms interval to handle various failures.
 			for range 10 {
-				conn, err = Dial(vsockID, uint32(port))
+				conn, err = DialContext(ctx, vsockID, uint32(port))
 				if err == nil {
 					break
 				} else {
@@ -44,7 +49,7 @@ func HTTPClient(vsockID uint32, port int, tlsClientCert string, tlsClientKey str
 					msg := err.Error()
 					if strings.Contains(msg, "connection timed out") {
 						// Retry once.
-						conn, err = Dial(vsockID, uint32(port))
+						conn, err = DialContext(ctx, vsockID, uint32(port))
 						break
 					} else if strings.Contains(msg, "connection refused") {
 						break
@@ -53,7 +58,11 @@ func HTTPClient(vsockID uint32, port int, tlsClientCert string, tlsClientKey str
 					// Retry the rest.
 				}
 
-				time.Sleep(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(100 * time.Millisecond):
+				}
 			}
 
 			if err != nil {
