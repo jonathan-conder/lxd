@@ -13,6 +13,7 @@ package main
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -165,6 +166,7 @@ void forkproxy(void)
 				strerror(errno), sk_fds[1]);
 	} else {
 		pthread_t thread;
+		bool connect_needs_pidns;
 		int connect_nsfd;
 
 		whoami = FORKPROXY_PARENT;
@@ -195,8 +197,35 @@ void forkproxy(void)
 			_exit(EXIT_FAILURE);
 		}
 
+		connect_needs_pidns = connect_pid != getppid();
+		if (connect_needs_pidns &&
+		    !change_namespaces(connect_pidfd, connect_nsfd, CLONE_NEWPID)) {
+			fprintf(stderr, "Error: %m - Failed setns to connector PID namespace\n");
+			_exit(EXIT_FAILURE);
+		}
+
 		close_prot_errno_disarm(connect_nsfd);
 		close_prot_errno_disarm(connect_pidfd);
+
+		if (connect_needs_pidns) {
+			pid_t worker_pid = fork();
+
+			if (worker_pid < 0) {
+				fprintf(stderr, "%m - Failed creating connector process\n");
+				_exit(EXIT_FAILURE);
+			}
+
+			if (worker_pid > 0) {
+				close_prot_errno_disarm(sk_fds[0]);
+				wait_for_pid(worker_pid);
+				wait_for_pid(pid);
+				_exit(EXIT_SUCCESS);
+			}
+
+			if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+				_exit(EXIT_FAILURE);
+			}
+		}
 
 		ret = dup3(sk_fds[0], FORKPROXY_UDS_SOCK_FD_NUM, O_CLOEXEC);
 		if (ret < 0) {
@@ -230,10 +259,12 @@ void forkproxy(void)
 		// Create detached waiting thread after all namespace
 		// interactions have concluded since some of them require
 		// single-threadedness.
-		if (pthread_create(&thread, NULL, async_wait_kludge, INT_TO_PTR(pid)) ||
-		    pthread_detach(thread)) {
-			fprintf(stderr, "%m - Failed creating detached thread\n");
-			_exit(EXIT_FAILURE);
+		if (!connect_needs_pidns) {
+			if (pthread_create(&thread, NULL, async_wait_kludge, INT_TO_PTR(pid)) ||
+			    pthread_detach(thread)) {
+				fprintf(stderr, "%m - Failed creating detached thread\n");
+				_exit(EXIT_FAILURE);
+			}
 		}
 	}
 }
