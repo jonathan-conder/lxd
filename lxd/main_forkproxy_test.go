@@ -383,6 +383,47 @@ func TestRelayHalfClose(t *testing.T) {
 	}
 }
 
+func TestRelayCopyError(t *testing.T) {
+	tests := []struct {
+		name     string
+		left     string
+		right    string
+		resetEnd string
+	}{
+		{name: "TCP to TCP", left: "tcp", right: "tcp", resetEnd: "left"},
+		{name: "TCP to Unix", left: "tcp", right: "unix", resetEnd: "left"},
+		{name: "Unix to TCP", left: "unix", right: "tcp", resetEnd: "right"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			leftProxy, leftPeer := testStreamPair(t, test.left)
+			rightProxy, rightPeer := testStreamPair(t, test.right)
+
+			relayDone := make(chan struct{})
+			go func() {
+				genericRelay(leftProxy, rightProxy)
+				close(relayDone)
+			}()
+
+			resetPeer := leftPeer
+			if test.resetEnd == "right" {
+				resetPeer = rightPeer
+			}
+
+			tcpPeer := resetPeer.(*net.TCPConn)
+			require.NoError(t, tcpPeer.SetLinger(0))
+			require.NoError(t, tcpPeer.Close())
+
+			select {
+			case <-relayDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Relay did not stop after a connection reset")
+			}
+		})
+	}
+}
+
 func countOpenFDsForPath(t *testing.T, path string) int {
 	t.Helper()
 

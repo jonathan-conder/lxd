@@ -1468,11 +1468,19 @@ func genericRelay(dst net.Conn, src net.Conn) {
 			if daemon.Debug && errSend != nil {
 				fmt.Printf("Warning: Error while sending data: %v\n", errSend)
 			}
+			if errSend != nil {
+				_ = src.Close()
+				_ = dst.Close()
+			}
 			chSend = nil
 
 		case errRecv := <-chRecv:
 			if daemon.Debug && errRecv != nil {
 				fmt.Printf("Warning: Error while reading data: %v\n", errRecv)
+			}
+			if errRecv != nil {
+				_ = src.Close()
+				_ = dst.Close()
 			}
 			chRecv = nil
 		}
