@@ -10,7 +10,7 @@ discourse: lxc:[Using&#32;proxy&#32;device&#32;to&#32;forward&#32;network&#32;co
 ```
 
 ```{note}
-The `proxy` device type is supported for both containers (NAT and non-NAT modes) and VMs (NAT mode only).
+The `proxy` device type is supported for both containers and VMs, in NAT and non-NAT modes.
 It supports hotplugging for both containers and VMs.
 ```
 
@@ -23,6 +23,9 @@ You can use them to:
 
 In {ref}`devices-proxy-nat-mode`, proxy devices support TCP and UDP proxying (traffic forwarding).
 In non-NAT mode, proxy devices can also forward traffic between Unix sockets, which is useful for tasks such as forwarding a GUI or audio traffic from a container to the host system. Additionally, they can proxy traffic across different protocols—for example, forwarding traffic from a TCP listener on the host to a Unix socket inside a container.
+
+For VMs, non-NAT forwarding is carried over the authenticated VSOCK channel provided by the LXD agent.
+UDP datagrams are carried as length-delimited messages over VSOCK, preserving separate datagrams and responses.
 
 The supported connection types are:
 
