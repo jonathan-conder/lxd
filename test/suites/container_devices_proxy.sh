@@ -46,6 +46,13 @@ container_devices_proxy_validation() {
   fi
   [[ "${VALIDATION_ERROR}" == *"Mismatch between listen port(s) and connect port(s) count"* ]]
 
+  # Check that UDP listeners cannot connect to stream sockets.
+  if VALIDATION_ERROR=$(lxc config device add proxyTester proxyDev proxy "listen=udp:127.0.0.1:${HOST_TCP_PORT}" "connect=tcp:127.0.0.1:4321" bind=host 2>&1); then
+    echo "Proxy device shouldn't proxy UDP listeners to non-UDP targets"
+    false
+  fi
+  [[ "${VALIDATION_ERROR}" == *"Proxying from UDP to non-UDP protocols is not supported"* ]]
+
   # Check using wildcard addresses isn't allowed in NAT mode.
   if lxc config device add proxyTester proxyDev proxy "listen=tcp:0.0.0.0:$HOST_TCP_PORT" connect=tcp:0.0.0.0:4321 nat=true ; then
     echo "Proxy device shouldn't allow wildcard IPv4 listen addresses in NAT mode"

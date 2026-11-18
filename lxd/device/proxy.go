@@ -187,6 +187,10 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 		return err
 	}
 
+	if listenAddr.ConnType == "udp" && connectAddr.ConnType != "udp" {
+		return errors.New("Proxying from UDP to non-UDP protocols is not supported")
+	}
+
 	err = d.validateListenAddressConflicts(net.ParseIP(listenAddr.Address))
 	if err != nil {
 		return err
