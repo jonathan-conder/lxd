@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -296,4 +297,88 @@ func TestRelayHalfClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRelayUDP(t *testing.T) {
+	type relay struct {
+		listener *net.UDPConn
+		target   *net.UDPConn
+		prefix   string
+	}
+
+	relays := make([]relay, 2)
+	for i := range relays {
+		proxyListener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = proxyListener.Close() })
+
+		targetListener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = targetListener.Close() })
+
+		listenerFile, err := proxyListener.File()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = listenerFile.Close() })
+
+		listenerConn, err := net.FileConn(listenerFile)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = listenerConn.Close() })
+
+		targetConn, err := net.DialUDP("udp4", nil, targetListener.LocalAddr().(*net.UDPAddr))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = targetConn.Close() })
+
+		prefix := fmt.Sprintf("target-%d:", i)
+		relays[i] = relay{
+			listener: proxyListener,
+			target:   targetListener,
+			prefix:   prefix,
+		}
+		go genericRelay(listenerConn, targetConn)
+
+		go func() {
+			buf := make([]byte, 64)
+			n, clientAddr, err := targetListener.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+
+			response := append([]byte(prefix), buf[:n]...)
+			_, _ = targetListener.WriteToUDP(response, clientAddr)
+		}()
+	}
+
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	require.NoError(t, client.SetDeadline(deadline))
+	for i := range relays {
+		require.NoError(t, relays[i].target.SetDeadline(deadline))
+		_, err = client.WriteToUDP([]byte("datagram"), relays[i].listener.LocalAddr().(*net.UDPAddr))
+		require.NoError(t, err)
+	}
+
+	responses := make(map[string]bool)
+	for range relays {
+		buf := make([]byte, 64)
+		n, _, err := client.ReadFromUDP(buf)
+		require.NoError(t, err)
+		responses[string(buf[:n])] = true
+	}
+
+	require.Equal(t, map[string]bool{
+		"target-0:datagram": true,
+		"target-1:datagram": true,
+	}, responses)
+
+	udpSessionsLock.Lock()
+	for key, session := range udpSessions {
+		session.timer.Stop()
+		_ = session.target.Close()
+		delete(udpSessions, key)
+	}
+
+	udpSessionsLock.Unlock()
 }

@@ -270,8 +270,13 @@ type cmdForkproxy struct {
 	global *cmdGlobal
 }
 
-// UDP session tracking (map "client tuple" to udp session).
-var udpSessions = map[string]*udpSession{}
+type udpSessionKey struct {
+	listener string
+	client   string
+}
+
+// UDP session tracking (map listener/client tuple to udp session).
+var udpSessions = map[udpSessionKey]*udpSession{}
 var udpSessionsLock sync.Mutex
 
 type udpSession struct {
@@ -714,9 +719,14 @@ func proxyCopy(dst net.Conn, src net.Conn) error {
 			var addr net.Addr
 			nr, addr, er = srcUDP.ReadFrom(buf)
 			if er == nil {
+				sessionKey := udpSessionKey{
+					listener: srcUDP.LocalAddr().String(),
+					client:   addr.String(),
+				}
+
 				// Look for existing UDP session
 				udpSessionsLock.Lock()
-				us, ok := udpSessions[addr.String()]
+				us, ok := udpSessions[sessionKey]
 				udpSessionsLock.Unlock()
 
 				if !ok {
@@ -730,18 +740,19 @@ func proxyCopy(dst net.Conn, src net.Conn) error {
 						target: dc,
 					}
 
-					udpSessionsLock.Lock()
-					udpSessions[addr.String()] = us
-					udpSessionsLock.Unlock()
-
-					go func() { _ = proxyCopy(src, dc) }()
 					us.timer = time.AfterFunc(30*time.Minute, func() {
 						_ = us.target.Close()
 
 						udpSessionsLock.Lock()
-						delete(udpSessions, addr.String())
+						delete(udpSessions, sessionKey)
 						udpSessionsLock.Unlock()
 					})
+
+					udpSessionsLock.Lock()
+					udpSessions[sessionKey] = us
+					udpSessionsLock.Unlock()
+
+					go func() { _ = proxyCopy(src, dc) }()
 				}
 
 				us.timerLock.Lock()
@@ -771,7 +782,7 @@ func proxyCopy(dst net.Conn, src net.Conn) error {
 
 				udpSessionsLock.Lock()
 				for _, v := range udpSessions {
-					if v.target.LocalAddr() == src.LocalAddr() {
+					if v.target.LocalAddr().String() == src.LocalAddr().String() {
 						us = v
 						break
 					}
