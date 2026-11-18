@@ -18,6 +18,15 @@ test_container_devices_proxy() {
   unset HOST_TCP_PORT HOST_TCP_PORT2 HOST_TCP_PORT3
 }
 
+test_vm_devices_proxy() {
+  HOST_TCP_PORT="$(local_tcp_port)"
+  HOST_TCP_PORT2="$(local_tcp_port)"
+
+  container_devices_proxy_vm
+
+  unset HOST_TCP_PORT HOST_TCP_PORT2
+}
+
 container_devices_proxy_validation() {
   echo "====> Testing proxy validation"
 
@@ -452,8 +461,109 @@ container_devices_proxy_tcp_unix() {
     false
   fi
 
+  # Verify that EOF is forwarded from a container TCP listener to a host Unix socket.
+  lxc config device remove proxyTester proxyDev
+  HOST_SOCK="${TEST_DIR}/lxdtest-$(basename "${LXD_DIR}")-host.sock"
+  socat unix-listen:"${HOST_SOCK}",unlink-early exec:/bin/cat &
+  NSENTER_PID=$!
+
+  lxc config device add proxyTester proxyDev proxy listen=tcp:127.0.0.1:4321 connect=unix:"${HOST_SOCK}" bind=instance
+  sleep 0.2
+
+  ECHO=$(echo "${MESSAGE}" | lxc exec proxyTester -- socat - tcp4:127.0.0.1:4321,shut-down)
+  kill "${NSENTER_PID}" 2>/dev/null || true
+  wait "${NSENTER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/proxyTester/proxy.proxyDev.log"
+    echo "Proxy device did not forward TCP EOF to the host Unix socket"
+    false
+  fi
+
   # Cleanup
   lxc delete -f proxyTester
+}
+
+container_devices_proxy_vm() {
+  echo "====> Testing VM non-NAT proxying"
+
+  ensure_import_ubuntu_vm_image
+  VM_NAME="proxyVM"
+  MESSAGE="Proxy device test string: VM"
+  lxc launch ubuntu-vm "${VM_NAME}" --vm -c limits.memory=384MiB -d "${SMALL_VM_ROOT_DISK}"
+  waitInstanceReady "${VM_NAME}"
+
+  # Host-bound proxy connecting to a TCP listener in the VM.
+  VM_PORT=4321
+  lxc exec "${VM_NAME}" -- python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1', ${VM_PORT})); s.listen(); c,_=s.accept(); data=b''.join(iter(lambda: c.recv(4096), b'')); c.sendall(data)" &
+  VM_SERVER_PID=$!
+  lxc config device add "${VM_NAME}" proxyDev proxy listen=tcp:127.0.0.1:"${HOST_TCP_PORT}" connect=tcp:127.0.0.1:"${VM_PORT}" bind=host nat=false
+  sleep 0.2
+
+  ECHO=$(echo "${MESSAGE}" | socat - tcp4:127.0.0.1:"${HOST_TCP_PORT}",shut-down)
+  kill "${VM_SERVER_PID}" 2>/dev/null || true
+  wait "${VM_SERVER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/${VM_NAME}/proxy.proxyDev.log"
+    echo "VM proxy did not properly send data from the host to the VM"
+    false
+  fi
+
+  # Instance-bound proxy connecting back to a TCP listener on the host.
+  lxc config device remove "${VM_NAME}" proxyDev
+  socat tcp4-listen:"${HOST_TCP_PORT2}" exec:/bin/cat &
+  HOST_SERVER_PID=$!
+  lxc config device add "${VM_NAME}" proxyDev proxy listen=tcp:127.0.0.1:4322 connect=tcp:127.0.0.1:"${HOST_TCP_PORT2}" bind=instance nat=false
+  sleep 0.2
+
+  ECHO=$(lxc exec "${VM_NAME}" -- python3 -c "import socket,sys; s=socket.create_connection(('127.0.0.1', 4322)); s.sendall(b'${MESSAGE}'); s.shutdown(socket.SHUT_WR); sys.stdout.buffer.write(s.recv(4096))")
+  kill "${HOST_SERVER_PID}" 2>/dev/null || true
+  wait "${HOST_SERVER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/${VM_NAME}/proxy.proxyDev.log"
+    echo "VM proxy did not properly send data from the VM to the host"
+    false
+  fi
+
+  # Host-bound UDP proxy connecting to a listener in the VM.
+  lxc config device remove "${VM_NAME}" proxyDev
+  VM_PORT=4323
+  lxc exec "${VM_NAME}" -- python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('127.0.0.1', ${VM_PORT})); data,client=s.recvfrom(4096); s.sendto(data, client)" &
+  VM_SERVER_PID=$!
+  lxc config device add "${VM_NAME}" proxyDev proxy listen=udp:127.0.0.1:"${HOST_TCP_PORT}" connect=udp:127.0.0.1:"${VM_PORT}" bind=host nat=false
+  sleep 0.2
+
+  ECHO=$(echo "${MESSAGE}" | socat - udp4:127.0.0.1:"${HOST_TCP_PORT}")
+  kill "${VM_SERVER_PID}" 2>/dev/null || true
+  wait "${VM_SERVER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/${VM_NAME}/proxy.proxyDev.log"
+    echo "VM proxy did not properly send UDP data from the host to the VM"
+    false
+  fi
+
+  # Instance-bound UDP proxy connecting to a listener on the host.
+  lxc config device remove "${VM_NAME}" proxyDev
+  socat udp4-listen:"${HOST_TCP_PORT2}" exec:/bin/cat &
+  HOST_SERVER_PID=$!
+  lxc config device add "${VM_NAME}" proxyDev proxy listen=udp:127.0.0.1:4324 connect=udp:127.0.0.1:"${HOST_TCP_PORT2}" bind=instance nat=false
+  sleep 0.2
+
+  ECHO=$(lxc exec "${VM_NAME}" -- python3 -c "import socket,sys; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5); s.sendto(b'${MESSAGE}', ('127.0.0.1', 4324)); sys.stdout.buffer.write(s.recv(4096))")
+  kill "${HOST_SERVER_PID}" 2>/dev/null || true
+  wait "${HOST_SERVER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/${VM_NAME}/proxy.proxyDev.log"
+    echo "VM proxy did not properly send UDP data from the VM to the host"
+    false
+  fi
+
+  lxc delete -f "${VM_NAME}"
+  unset VM_NAME VM_PORT MESSAGE
 }
 
 container_devices_proxy_unix_tcp() {
