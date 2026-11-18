@@ -312,27 +312,32 @@ func (r *proxyListenServe) Render(w http.ResponseWriter, request *http.Request) 
 	}()
 
 	var conns sync.Map
+	closeConnections := func() {
+		conns.Range(func(key any, value any) bool {
+			_ = key.(net.Conn).Close()
+			callback, ok := value.(net.Conn)
+			if ok {
+				_ = callback.Close()
+			}
+
+			return true
+		})
+	}
+
 	for {
 		select {
 		case <-controlClosed:
 			cancel()
 			close(done)
 			_ = r.listener.Close()
-			conns.Range(func(key any, value any) bool {
-				_ = key.(net.Conn).Close()
-				callback, ok := value.(net.Conn)
-				if ok {
-					_ = callback.Close()
-				}
-
-				return true
-			})
+			closeConnections()
 
 			return nil
 		case <-listenerClosed:
 			cancel()
 			close(done)
 			_ = control.Close()
+			closeConnections()
 			return nil
 		case conn := <-accepted:
 			go func(conn net.Conn) {
