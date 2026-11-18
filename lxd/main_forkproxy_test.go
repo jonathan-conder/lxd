@@ -5,11 +5,13 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/network"
@@ -379,6 +381,61 @@ func TestRelayHalfClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+func countOpenFDsForPath(t *testing.T, path string) int {
+	t.Helper()
+
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+
+	count := 0
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		if target == path {
+			count++
+		}
+	}
+
+	return count
+}
+
+func TestUnixRelayClosesRightsOnError(t *testing.T) {
+	leftProxy, leftPeer := testStreamPair(t, "unix")
+	rightProxy, rightPeer := testStreamPair(t, "unix")
+
+	leftUnix := leftPeer.(*net.UnixConn)
+	_ = rightPeer.Close()
+
+	file, err := os.CreateTemp(t.TempDir(), "rights")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = file.Close() })
+
+	relayDone := make(chan struct{})
+	go func() {
+		unixRelay(leftProxy, rightProxy)
+		close(relayDone)
+	}()
+
+	n, oobn, err := leftUnix.WriteMsgUnix([]byte{1}, unix.UnixRights(int(file.Fd())), nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.Positive(t, oobn)
+
+	require.NoError(t, leftUnix.CloseWrite())
+	select {
+	case <-relayDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Relay did not stop after both sides closed")
+	}
+
+	require.Eventually(t, func() bool {
+		return countOpenFDsForPath(t, file.Name()) == 1
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
 func TestRelayUDP(t *testing.T) {

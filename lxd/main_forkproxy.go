@@ -1482,6 +1482,18 @@ func genericRelay(dst net.Conn, src net.Conn) {
 	_ = dst.Close()
 }
 
+func closeUnixFDs(fds []int) error {
+	var closeErr error
+	for _, fd := range fds {
+		err := unix.Close(fd)
+		if err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+
+	return closeErr
+}
+
 func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan error) {
 	dataBuf := make([]byte, 4096)
 	oobBuf := make([]byte, 4096)
@@ -1522,11 +1534,14 @@ func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan error) {
 			}
 
 			for _, msg := range entries {
-				fds, err = unix.ParseUnixRights(&msg)
+				msgFds, err := unix.ParseUnixRights(&msg)
 				if err != nil {
+					_ = closeUnixFDs(fds)
 					ch <- err
 					return
 				}
+
+				fds = append(fds, msgFds...)
 			}
 		}
 
@@ -1539,22 +1554,21 @@ func unixRelayer(src *net.UnixConn, dst *net.UnixConn, ch chan error) {
 				goto writeAgain
 			}
 
+			_ = closeUnixFDs(fds)
 			ch <- err
 			return
 		}
 
 		if sData != tData || sOob != tOob {
+			_ = closeUnixFDs(fds)
 			ch <- errors.New("Lost oob data during transfer")
 			return
 		}
 
-		// Close those fds we received
-		for _, fd := range fds {
-			err := unix.Close(fd)
-			if err != nil {
-				ch <- err
-				return
-			}
+		err = closeUnixFDs(fds)
+		if err != nil {
+			ch <- err
+			return
 		}
 	}
 }
