@@ -542,6 +542,42 @@ container_devices_proxy_vm() {
     false
   fi
 
+  # Host-bound Unix socket proxy connecting to a Unix listener in the VM.
+  lxc config device remove "${VM_NAME}" proxyDev
+  HOST_SOCK="${TEST_DIR}/lxdtest-$(basename "${LXD_DIR}")-vm-host.sock"
+  VM_SOCK="/tmp/lxd-proxy-vm.sock"
+  lxc exec "${VM_NAME}" -- python3 -c "import os,socket; p='${VM_SOCK}'; os.unlink(p) if os.path.exists(p) else None; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); c,_=s.accept(); data=b''.join(iter(lambda: c.recv(4096), b'')); c.sendall(data)" &
+  VM_SERVER_PID=$!
+  lxc config device add "${VM_NAME}" proxyDev proxy listen=unix:"${HOST_SOCK}" connect=unix:"${VM_SOCK}" bind=host nat=false
+  sleep 0.2
+
+  ECHO=$(python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect('${HOST_SOCK}'); s.sendall(b'${MESSAGE}'); s.shutdown(socket.SHUT_WR); sys.stdout.buffer.write(b''.join(iter(lambda: s.recv(4096), b'')))")
+  kill "${VM_SERVER_PID}" 2>/dev/null || true
+  wait "${VM_SERVER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/${VM_NAME}/proxy.proxyDev.log"
+    echo "VM proxy did not properly send Unix socket data from the host to the VM"
+    false
+  fi
+
+  # Instance-bound Unix socket proxy connecting to a Unix listener on the host.
+  lxc config device remove "${VM_NAME}" proxyDev
+  socat unix-listen:"${HOST_SOCK}",unlink-early exec:/bin/cat &
+  HOST_SERVER_PID=$!
+  lxc config device add "${VM_NAME}" proxyDev proxy listen=unix:/tmp/lxd-proxy-vm-client.sock connect=unix:"${HOST_SOCK}" bind=instance nat=false
+  sleep 0.2
+
+  ECHO=$(lxc exec "${VM_NAME}" -- python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect('/tmp/lxd-proxy-vm-client.sock'); s.sendall(b'${MESSAGE}'); s.shutdown(socket.SHUT_WR); sys.stdout.buffer.write(b''.join(iter(lambda: s.recv(4096), b'')))")
+  kill "${HOST_SERVER_PID}" 2>/dev/null || true
+  wait "${HOST_SERVER_PID}" 2>/dev/null || true
+
+  if [ "${ECHO}" != "${MESSAGE}" ]; then
+    cat "${LXD_DIR}/logs/${VM_NAME}/proxy.proxyDev.log"
+    echo "VM proxy did not properly send Unix socket data from the VM to the host"
+    false
+  fi
+
   # Host-bound UDP proxy connecting to a listener in the VM.
   lxc config device remove "${VM_NAME}" proxyDev
   VM_PORT=4323
