@@ -214,23 +214,40 @@ void forkproxy(void)
 		close_prot_errno_disarm(connect_pidfd);
 
 		if (connect_needs_pidns) {
-			pid_t worker_pid = fork();
+			char notification;
+			int parent_notify_fds[2] = {-EBADF, -EBADF};
+			pid_t worker_pid;
 
+			if (pipe2(parent_notify_fds, O_CLOEXEC | O_NONBLOCK) < 0) {
+				fprintf(stderr, "%m - Failed creating connector supervisor notification pipe\n");
+				_exit(EXIT_FAILURE);
+			}
+
+			worker_pid = fork();
 			if (worker_pid < 0) {
 				fprintf(stderr, "%m - Failed creating connector process\n");
 				_exit(EXIT_FAILURE);
 			}
 
 			if (worker_pid > 0) {
+				close_prot_errno_disarm(parent_notify_fds[0]);
 				close_prot_errno_disarm(sk_fds[0]);
 				wait_for_pid(worker_pid);
 				wait_for_pid(pid);
 				_exit(EXIT_SUCCESS);
 			}
 
+			close_prot_errno_disarm(parent_notify_fds[1]);
 			if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
 				_exit(EXIT_FAILURE);
 			}
+
+			ret = read(parent_notify_fds[0], &notification, 1);
+			if (ret == 0 || (ret < 0 && errno != EAGAIN)) {
+				_exit(EXIT_FAILURE);
+			}
+
+			close_prot_errno_disarm(parent_notify_fds[0]);
 		}
 
 		ret = dup3(sk_fds[0], FORKPROXY_UDS_SOCK_FD_NUM, O_CLOEXEC);
