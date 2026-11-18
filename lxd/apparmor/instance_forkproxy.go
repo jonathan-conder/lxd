@@ -25,7 +25,9 @@ type device interface {
 var forkproxyProfileTpl = template.Must(template.New("forkproxyProfile").Parse(`#include <tunables/global>
 profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
+{{- if .agentCertPath }}
   #include <abstractions/ssl_certs>
+{{- end }}
 
   # Allow processes to send us signals by default
   signal (receive),
@@ -50,7 +52,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   network inet stream,
   network inet6 stream,
   network unix stream,
+{{- if .agentCertPath }}
   network vsock stream,
+{{- end }}
 
   # Forkproxy operation
   {{ .logPath }}/** rw,
