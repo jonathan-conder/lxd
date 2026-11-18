@@ -41,6 +41,7 @@ type proxy struct {
 }
 
 type proxyProcInfo struct {
+	vm             bool
 	listenPid      string
 	listenPidFd    string
 	connectPid     string
@@ -54,6 +55,10 @@ type proxyProcInfo struct {
 	securityGID    string
 	proxyProtocol  string
 	inheritFds     []*os.File
+	vsockID        string
+	agentCertPath  string
+	clientCertPath string
+	clientKeyPath  string
 }
 
 // CanHotPlug returns whether the device can be managed whilst the instance is running.
@@ -168,8 +173,8 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader) error {
 		return err
 	}
 
-	if instConf.Type() == instancetype.VM && shared.IsFalseOrEmpty(d.config["nat"]) {
-		return errors.New("Only NAT mode is supported for proxies on VM instances")
+	if instConf.Type() == instancetype.VM && shared.IsFalseOrEmpty(d.config["nat"]) && (d.config["security.uid"] != "" || d.config["security.gid"] != "") {
+		return errors.New("VM proxies do not support security.uid or security.gid")
 	}
 
 	listenAddr, err := network.ProxyParseAddr(d.config["listen"])
@@ -321,20 +326,37 @@ func (d *proxy) Start() (*deviceConfig.RunConfig, error) {
 
 			// Spawn the daemon using subprocess
 			command := d.state.OS.ExecPath
-			forkproxyargs := []string{"forkproxy",
-				"--",
-				proxyValues.listenPid,
-				proxyValues.listenPidFd,
-				proxyValues.listenAddr,
-				proxyValues.connectPid,
-				proxyValues.connectPidFd,
-				proxyValues.connectAddr,
-				proxyValues.listenAddrGID,
-				proxyValues.listenAddrUID,
-				proxyValues.listenAddrMode,
-				proxyValues.securityGID,
-				proxyValues.securityUID,
-				proxyValues.proxyProtocol,
+			forkproxyargs := []string{"forkproxy", "--"}
+			if proxyValues.vm {
+				forkproxyargs = append(forkproxyargs,
+					"vm",
+					proxyValues.listenAddr,
+					proxyValues.connectAddr,
+					d.config["bind"],
+					proxyValues.vsockID,
+					proxyValues.agentCertPath,
+					proxyValues.clientCertPath,
+					proxyValues.clientKeyPath,
+					proxyValues.listenAddrMode,
+					proxyValues.listenAddrUID,
+					proxyValues.listenAddrGID,
+					proxyValues.proxyProtocol,
+				)
+			} else {
+				forkproxyargs = append(forkproxyargs,
+					proxyValues.listenPid,
+					proxyValues.listenPidFd,
+					proxyValues.listenAddr,
+					proxyValues.connectPid,
+					proxyValues.connectPidFd,
+					proxyValues.connectAddr,
+					proxyValues.listenAddrGID,
+					proxyValues.listenAddrUID,
+					proxyValues.listenAddrMode,
+					proxyValues.securityGID,
+					proxyValues.securityUID,
+					proxyValues.proxyProtocol,
+				)
 			}
 
 			p, err := subprocess.NewProcess(command, forkproxyargs, logPath, logPath)
@@ -583,6 +605,43 @@ func (d *proxy) rewriteHostAddr(addr string) string {
 }
 
 func (d *proxy) setupProxyProcInfo() (*proxyProcInfo, error) {
+	if d.inst.Type() == instancetype.VM {
+		vsockID := d.inst.ExpandedConfig()["volatile.vsock_id"]
+		if vsockID == "" {
+			return nil, errors.New("VM context ID is not set")
+		}
+
+		connectAddr := d.config["connect"]
+		listenAddr := d.config["listen"]
+		switch d.config["bind"] {
+		case "host", "":
+			listenAddr = d.rewriteHostAddr(listenAddr)
+		case "instance", "guest", "container":
+			connectAddr = d.rewriteHostAddr(connectAddr)
+		default:
+			return nil, errors.New("Invalid binding side given. Must be \"host\" or \"instance\"")
+		}
+
+		listenAddrMode := "0644"
+		if d.config["mode"] != "" {
+			listenAddrMode = d.config["mode"]
+		}
+
+		return &proxyProcInfo{
+			vm:             true,
+			vsockID:        vsockID,
+			listenAddr:     listenAddr,
+			connectAddr:    connectAddr,
+			listenAddrMode: listenAddrMode,
+			listenAddrUID:  d.config["uid"],
+			listenAddrGID:  d.config["gid"],
+			proxyProtocol:  d.config["proxy_protocol"],
+			agentCertPath:  filepath.Join(d.inst.Path(), "agent.crt"),
+			clientCertPath: filepath.Join(d.inst.Path(), "agent-client.crt"),
+			clientKeyPath:  filepath.Join(d.inst.Path(), "agent-client.key"),
+		}, nil
+	}
+
 	cname := project.Instance(d.inst.Project().Name, d.inst.Name())
 	cc, err := liblxc.NewContainer(cname, d.state.OS.LxcPath)
 	if err != nil {
@@ -685,7 +744,7 @@ func (d *proxy) killProxyProc(pidPath string) error {
 
 	// Remove socket file if needed.
 	// Unix non-abstract sockets are addressed to the host filesystem, not scoped inside the LXD snap.
-	if listenAddr.ConnType == "unix" && !listenAddr.Abstract && d.config["bind"] == "host" {
+	if listenAddr.ConnType == "unix" && !listenAddr.Abstract && (d.config["bind"] == "host" || d.config["bind"] == "") {
 		err = os.Remove(shared.HostPath(listenAddr.Address))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("Failed removing socket file: %w", err)

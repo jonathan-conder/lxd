@@ -9,6 +9,7 @@ import (
 	"text/template"
 
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
+	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/project"
 	"github.com/canonical/lxd/lxd/sys"
 	"github.com/canonical/lxd/lxd/util"
@@ -24,6 +25,7 @@ type device interface {
 var forkproxyProfileTpl = template.Must(template.New("forkproxyProfile").Parse(`#include <tunables/global>
 profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
+  #include <abstractions/ssl_certs>
 
   # Allow processes to send us signals by default
   signal (receive),
@@ -48,6 +50,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   network inet stream,
   network inet6 stream,
   network unix stream,
+  network vsock stream,
 
   # Forkproxy operation
   {{ .logPath }}/** rw,
@@ -60,6 +63,12 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   {{ .rootPath }}/run/systemd/resolve/stub-resolv.conf r,
   {{ .rootPath }}/run/{resolvconf,NetworkManager,systemd/resolve,connman,netconfig}/resolv.conf r,
   {{ .rootPath }}/usr/lib/systemd/resolv.conf r,
+{{- if .agentCertPath }}
+
+  "{{ .agentCertPath }}" r,
+  "{{ .clientCertPath }}" r,
+  "{{ .clientKeyPath }}" r,
+{{- end }}
 
   # Needed for lxd fork commands
   "{{ .exePath }}" mr,
@@ -165,18 +174,41 @@ func forkproxyProfile(inst instance, dev device) (string, error) {
 		execPath = execPathFull
 	}
 
+	agentCertPath := ""
+	clientCertPath := ""
+	clientKeyPath := ""
+	if inst.Type() == instancetype.VM {
+		agentCertPath, err = filepath.EvalSymlinks(filepath.Join(inst.Path(), "agent.crt"))
+		if err != nil {
+			return "", err
+		}
+
+		clientCertPath, err = filepath.EvalSymlinks(filepath.Join(inst.Path(), "agent-client.crt"))
+		if err != nil {
+			return "", err
+		}
+
+		clientKeyPath, err = filepath.EvalSymlinks(filepath.Join(inst.Path(), "agent-client.key"))
+		if err != nil {
+			return "", err
+		}
+	}
+
 	// Render the profile.
 	var sb = &strings.Builder{}
 	err = forkproxyProfileTpl.Execute(sb, map[string]any{
-		"name":        ForkproxyProfileName(inst, dev),
-		"varPath":     shared.VarPath(""),
-		"rootPath":    rootPath,
-		"snap":        shared.InSnap(),
-		"exePath":     rulePathEscaper.Replace(execPath),
-		"logPath":     inst.LogPath(),
-		"libraryPath": escapeRulePaths(profileLibraryPaths(execPath)),
-		"sockets":     escapeRulePaths(sockets),
-		"goCoverDir":  goCoverDir(),
+		"name":           ForkproxyProfileName(inst, dev),
+		"varPath":        shared.VarPath(""),
+		"rootPath":       rootPath,
+		"snap":           shared.InSnap(),
+		"exePath":        rulePathEscaper.Replace(execPath),
+		"logPath":        inst.LogPath(),
+		"libraryPath":    escapeRulePaths(profileLibraryPaths(execPath)),
+		"sockets":        escapeRulePaths(sockets),
+		"goCoverDir":     goCoverDir(),
+		"agentCertPath":  rulePathEscaper.Replace(agentCertPath),
+		"clientCertPath": rulePathEscaper.Replace(clientCertPath),
+		"clientKeyPath":  rulePathEscaper.Replace(clientKeyPath),
 	})
 	if err != nil {
 		return "", err

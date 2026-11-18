@@ -81,7 +81,13 @@ void forkproxy(void)
 	     strcmp(cur, "-h") == 0))
 		_exit(EXIT_FAILURE);
 
-	listen_pid = atoi(advance_arg(true));
+	cur = advance_arg(true);
+	if (strcmp(cur, "vm") == 0) {
+		whoami = FORKPROXY_PARENT;
+		return;
+	}
+
+	listen_pid = atoi(cur);
 	listen_pidfd = atoi(advance_arg(true));
 	listen_addr = advance_arg(true);
 	connect_pid = atoi(advance_arg(true));
@@ -272,10 +278,18 @@ void forkproxy(void)
 import "C"
 
 import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -284,6 +298,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/mdlayher/vsock"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 
@@ -291,6 +306,7 @@ import (
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	_ "github.com/canonical/lxd/lxd/include" // Used by cgo
 	"github.com/canonical/lxd/lxd/network"
+	lxdvsock "github.com/canonical/lxd/lxd/vsock"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/netutils"
 )
@@ -457,6 +473,10 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		return errors.New("Missing required arguments")
+	}
+
+	if args[0] == "vm" {
+		return c.runVMProxy(args)
 	}
 
 	// Check where we are in initialization
@@ -730,6 +750,548 @@ func (c *cmdForkproxy) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("Status: Stopping proxy")
+	return nil
+}
+
+func (c *cmdForkproxy) runVMProxy(args []string) error {
+	listenAddr, err := network.ProxyParseAddr(args[1])
+	if err != nil {
+		return err
+	}
+
+	connectAddr, err := network.ProxyParseAddr(args[2])
+	if err != nil {
+		return err
+	}
+
+	vsockID, err := strconv.ParseUint(args[4], 10, 32)
+	if err != nil {
+		return fmt.Errorf("Failed parsing VM context ID: %w", err)
+	}
+
+	agentCert, err := os.ReadFile(args[5])
+	if err != nil {
+		return fmt.Errorf("Failed reading VM agent certificate: %w", err)
+	}
+
+	clientCert, err := os.ReadFile(args[6])
+	if err != nil {
+		return fmt.Errorf("Failed reading VM client certificate: %w", err)
+	}
+
+	clientKey, err := os.ReadFile(args[7])
+	if err != nil {
+		return fmt.Errorf("Failed reading VM client key: %w", err)
+	}
+
+	client, err := lxdvsock.HTTPClient(uint32(vsockID), shared.HTTPSDefaultPort, string(clientCert), string(clientKey), string(agentCert))
+	if err != nil {
+		return err
+	}
+
+	switch args[3] {
+	case "", "host":
+		return runVMHostProxy(client, listenAddr, connectAddr, args[8], args[9], args[10], args[11] == "true")
+	case "instance", "guest", "container":
+		return runVMInstanceProxy(client, uint32(vsockID), listenAddr, connectAddr, args[8], args[9], args[10], args[11] == "true")
+	default:
+		return errors.New("Invalid binding side given. Must be \"host\" or \"instance\"")
+	}
+}
+
+type bufferedProxyConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedProxyConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *bufferedProxyConn) CloseWrite() error {
+	conn, ok := c.Conn.(closeWriter)
+	if !ok {
+		return errors.New("VM proxy connection does not support half-closing")
+	}
+
+	return conn.CloseWrite()
+}
+
+type vmAgentProxyUpgradeError struct {
+	status int
+	body   string
+}
+
+func (e *vmAgentProxyUpgradeError) Error() string {
+	return fmt.Sprintf("VM agent proxy upgrade failed with status %d: %s", e.status, e.body)
+}
+
+func vmAgentProxyConn(client *http.Client, values url.Values, upgrade string) (net.Conn, error) {
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("VM agent transport is an invalid HTTP transport")
+	}
+
+	u := &url.URL{
+		Scheme:   "https",
+		Host:     "custom.socket",
+		Path:     "/1.0/proxy",
+		RawQuery: values.Encode(),
+	}
+
+	req := &http.Request{
+		Method:     http.MethodGet,
+		URL:        u,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Host:       u.Host,
+	}
+	req.Header.Set("Upgrade", upgrade)
+	req.Header.Set("Connection", "Upgrade")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := transport.DialContext(ctx, "tcp", "8443")
+	if err != nil {
+		return nil, err
+	}
+
+	err = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	tlsConn := tls.Client(conn, transport.TLSClientConfig)
+	err = tlsConn.Handshake()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	err = req.Write(tlsConn)
+	if err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+
+	reader := bufio.NewReader(tlsConn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		_ = tlsConn.Close()
+		return nil, &vmAgentProxyUpgradeError{
+			status: resp.StatusCode,
+			body:   strings.TrimSpace(string(body)),
+		}
+	}
+
+	if resp.Header.Get("Upgrade") != upgrade {
+		_ = tlsConn.Close()
+		return nil, errors.New("Missing or unexpected VM agent proxy upgrade header")
+	}
+
+	err = tlsConn.SetDeadline(time.Time{})
+	if err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+
+	return &bufferedProxyConn{Conn: tlsConn, reader: reader}, nil
+}
+
+func proxyConfigAddress(addr *deviceConfig.ProxyAddress, portIndex int) string {
+	address := addr.Address
+	if addr.ConnType != "unix" {
+		port := addr.Ports[0]
+		if len(addr.Ports) > 1 {
+			port = addr.Ports[portIndex]
+		}
+
+		address = net.JoinHostPort(address, strconv.FormatUint(port, 10))
+	}
+
+	return addr.ConnType + ":" + address
+}
+
+func proxyListenAddress(addr *deviceConfig.ProxyAddress, portIndex int) string {
+	if addr.ConnType == "unix" {
+		return addr.Address
+	}
+
+	port := addr.Ports[0]
+	if len(addr.Ports) > 1 {
+		port = addr.Ports[portIndex]
+	}
+
+	return net.JoinHostPort(addr.Address, strconv.FormatUint(port, 10))
+}
+
+func proxyListenCount(addr *deviceConfig.ProxyAddress) int {
+	if addr.ConnType == "unix" {
+		return 1
+	}
+
+	return len(addr.Ports)
+}
+
+func proxyConnectIndex(connectAddr *deviceConfig.ProxyAddress, index int) int {
+	if connectAddr.ConnType != "unix" && len(connectAddr.Ports) > 1 {
+		return index
+	}
+
+	return 0
+}
+
+func runVMHostProxy(client *http.Client, listenAddr *deviceConfig.ProxyAddress, connectAddr *deviceConfig.ProxyAddress, mode string, uid string, gid string, proxyProtocol bool) error {
+	listeners := make([]io.Closer, 0, proxyListenCount(listenAddr))
+	revert := true
+	defer func() {
+		if revert {
+			for _, listener := range listeners {
+				_ = listener.Close()
+			}
+		}
+	}()
+
+	for i := 0; i < proxyListenCount(listenAddr); i++ {
+		listenAddress := proxyListenAddress(listenAddr, i)
+		if listenAddr.ConnType == "udp" {
+			udpAddr, err := net.ResolveUDPAddr("udp", listenAddress)
+			if err != nil {
+				return err
+			}
+
+			listener, err := net.ListenUDP("udp", udpAddr)
+			if err != nil {
+				return err
+			}
+
+			listeners = append(listeners, listener)
+			connectAddress := proxyConfigAddress(connectAddr, proxyConnectIndex(connectAddr, i))
+			go func() {
+				err := netutils.ProxyUDP(listener, func() (net.Conn, error) {
+					values := url.Values{
+						"mode":    {"connect"},
+						"address": {connectAddress},
+						"framed":  {strconv.FormatBool(listenAddr.ConnType == "udp")},
+					}
+
+					return vmAgentProxyConn(client, values, "lxd-proxy-connect")
+				}, 30*time.Minute, func(err error) {
+					fmt.Printf("Warning: Failed connecting to VM UDP target: %v\n", err)
+				})
+				if err != nil && daemon.Debug {
+					fmt.Printf("Warning: VM UDP listener stopped: %v\n", err)
+				}
+			}()
+			continue
+		}
+
+		if listenAddr.ConnType == "unix" && !listenAddr.Abstract {
+			err := os.Remove(listenAddress)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+
+		listener, err := tryListen(listenAddr.ConnType, listenAddress)
+		if err != nil {
+			return err
+		}
+
+		listeners = append(listeners, listener)
+		if listenAddr.ConnType == "unix" && !listenAddr.Abstract {
+			err = vmSetUnixSocketPermissions(listenAddress, mode, uid, gid)
+			if err != nil {
+				return err
+			}
+		}
+
+		acceptVMHostConnections(client, listener, proxyConfigAddress(connectAddr, proxyConnectIndex(connectAddr, i)), false, proxyProtocol)
+	}
+
+	revert = false
+	fmt.Println("Status: Started")
+	return waitProxyStop(listeners)
+}
+
+func vmSetUnixSocketPermissions(path string, mode string, uid string, gid string) error {
+	socketUID := -1
+	var err error
+	if uid != "" {
+		socketUID, err = strconv.Atoi(uid)
+		if err != nil {
+			return err
+		}
+	}
+
+	socketGID := -1
+	if gid != "" {
+		socketGID, err = strconv.Atoi(gid)
+		if err != nil {
+			return err
+		}
+	}
+
+	if socketUID != -1 || socketGID != -1 {
+		err = os.Chown(path, socketUID, socketGID)
+		if err != nil {
+			return err
+		}
+	}
+
+	if mode != "" {
+		parsedMode, err := strconv.ParseUint(mode, 8, 32)
+		if err != nil {
+			return err
+		}
+
+		err = os.Chmod(path, os.FileMode(parsedMode))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func acceptVMHostConnections(client *http.Client, listener net.Listener, connectAddress string, framed bool, proxyProtocol bool) {
+	go func() {
+		for {
+			srcConn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				values := url.Values{
+					"mode":    {"connect"},
+					"address": {connectAddress},
+					"framed":  {strconv.FormatBool(framed)},
+				}
+				dstConn, err := vmAgentProxyConn(client, values, "lxd-proxy-connect")
+				if err != nil {
+					fmt.Printf("Warning: Failed connecting to VM target: %v\n", err)
+					_ = srcConn.Close()
+					return
+				}
+
+				if proxyProtocol && strings.HasPrefix(connectAddress, "tcp:") {
+					err = writeProxyHeader(srcConn, dstConn)
+					if err != nil {
+						fmt.Printf("Warning: Failed writing PROXY header: %v\n", err)
+						_ = srcConn.Close()
+						_ = dstConn.Close()
+						return
+					}
+				}
+
+				genericRelay(srcConn, dstConn)
+			}()
+		}
+	}()
+}
+
+func writeProxyHeader(srcConn net.Conn, dstConn net.Conn) error {
+	header := "PROXY UNKNOWN\r\n"
+	if srcConn.LocalAddr().Network() != "unix" {
+		clientHost, clientPort, err := net.SplitHostPort(srcConn.RemoteAddr().String())
+		if err != nil {
+			return err
+		}
+
+		destHost, destPort, err := net.SplitHostPort(srcConn.LocalAddr().String())
+		if err != nil {
+			return err
+		}
+
+		proto := "TCP4"
+		if strings.Contains(clientHost, ":") {
+			proto = "TCP6"
+		}
+
+		header = fmt.Sprintf("PROXY %s %s %s %s %s\r\n", proto, clientHost, destHost, clientPort, destPort)
+	}
+
+	_, err := io.WriteString(dstConn, header)
+	return err
+}
+
+func runVMInstanceProxy(client *http.Client, vsockID uint32, listenAddr *deviceConfig.ProxyAddress, connectAddr *deviceConfig.ProxyAddress, mode string, uid string, gid string, proxyProtocol bool) error {
+	listeners := make([]io.Closer, 0, proxyListenCount(listenAddr))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	revert := true
+	defer func() {
+		if revert {
+			for _, listener := range listeners {
+				_ = listener.Close()
+			}
+		}
+	}()
+
+	for i := 0; i < proxyListenCount(listenAddr); i++ {
+		callbackListener, err := vsock.ListenContextID(vsock.Host, 0, nil)
+		if err != nil {
+			return err
+		}
+
+		callbackAddr, ok := callbackListener.Addr().(*vsock.Addr)
+		if !ok {
+			_ = callbackListener.Close()
+			return errors.New("VM proxy listener is not a vsock address")
+		}
+
+		tokenBytes := make([]byte, 32)
+		_, err = rand.Read(tokenBytes)
+		if err != nil {
+			_ = callbackListener.Close()
+			return fmt.Errorf("Failed generating VM proxy token: %w", err)
+		}
+
+		token := hex.EncodeToString(tokenBytes)
+		values := url.Values{
+			"mode":           {"listen"},
+			"address":        {proxyConfigAddress(listenAddr, i)},
+			"cid":            {strconv.FormatUint(uint64(vsock.Host), 10)},
+			"port":           {strconv.FormatUint(uint64(callbackAddr.Port), 10)},
+			"mode_file":      {mode},
+			"uid":            {uid},
+			"gid":            {gid},
+			"proxy_protocol": {strconv.FormatBool(proxyProtocol)},
+			"token":          {token},
+		}
+		listeners = append(listeners, callbackListener)
+		acceptVMInstanceConnections(callbackListener, vsockID, proxyConfigAddress(connectAddr, proxyConnectIndex(connectAddr, i)), token, listenAddr.ConnType == "udp")
+
+		control, err := vmAgentProxyConn(client, values, "lxd-proxy-listen")
+		var upgradeErr *vmAgentProxyUpgradeError
+		if err != nil && errors.As(err, &upgradeErr) {
+			return err
+		}
+
+		maintainVMInstanceListener(ctx, client, values, control)
+	}
+
+	revert = false
+	fmt.Println("Status: Started")
+	return waitProxyStop(listeners)
+}
+
+func maintainVMInstanceListener(ctx context.Context, client *http.Client, values url.Values, control net.Conn) {
+	go func() {
+		for {
+			var err error
+			if control == nil {
+				control, err = vmAgentProxyConn(client, values, "lxd-proxy-listen")
+			}
+
+			if control == nil {
+				if daemon.Debug {
+					fmt.Printf("Warning: Failed registering VM proxy listener: %v\n", err)
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+					continue
+				}
+			}
+
+			closed := make(chan struct{})
+			go func() {
+				_, _ = io.Copy(io.Discard, control)
+				close(closed)
+			}()
+
+			select {
+			case <-ctx.Done():
+				_ = control.Close()
+				return
+			case <-closed:
+				_ = control.Close()
+				control = nil
+			}
+		}
+	}()
+}
+
+func acceptVMInstanceConnections(listener net.Listener, vsockID uint32, connectAddress string, token string, framed bool) {
+	go func() {
+		for {
+			srcConn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			remoteAddr, ok := srcConn.RemoteAddr().(*vsock.Addr)
+			if !ok || remoteAddr.ContextID != vsockID {
+				_ = srcConn.Close()
+				continue
+			}
+
+			go func() {
+				err := srcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if err != nil {
+					_ = srcConn.Close()
+					return
+				}
+
+				peerToken := make([]byte, len(token))
+				_, err = io.ReadFull(srcConn, peerToken)
+				if err != nil || subtle.ConstantTimeCompare(peerToken, []byte(token)) != 1 {
+					_ = srcConn.Close()
+					return
+				}
+
+				err = srcConn.SetReadDeadline(time.Time{})
+				if err != nil {
+					_ = srcConn.Close()
+					return
+				}
+
+				targetAddr, err := network.ProxyParseAddr(connectAddress)
+				if err != nil {
+					_ = srcConn.Close()
+					return
+				}
+
+				target, err := net.Dial(targetAddr.ConnType, proxyListenAddress(targetAddr, 0))
+				if err != nil {
+					_ = srcConn.Close()
+					return
+				}
+
+				if framed {
+					netutils.RelayUDPConnected(srcConn, target)
+				} else {
+					genericRelay(srcConn, target)
+				}
+			}()
+		}
+	}()
+}
+
+func waitProxyStop(listeners []io.Closer) error {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, unix.SIGTERM)
+	<-sigs
+
+	for _, listener := range listeners {
+		_ = listener.Close()
+	}
+
 	return nil
 }
 
