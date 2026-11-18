@@ -36,7 +36,6 @@ import (
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/logger"
-	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
 
@@ -1431,66 +1430,7 @@ func BridgeNetfilterEnabled(ipVersion uint) error {
 
 // ProxyParseAddr validates a proxy address and parses it into its constituent parts.
 func ProxyParseAddr(data string) (*deviceConfig.ProxyAddress, error) {
-	// Split into <protocol> and <address>.
-	connType, addr, found := strings.Cut(data, ":")
-
-	if !slices.Contains([]string{"tcp", "udp", "unix"}, connType) {
-		return nil, fmt.Errorf("Unknown protocol type %q", connType)
-	}
-
-	if !found || addr == "" {
-		return nil, errors.New("Missing address")
-	}
-
-	newProxyAddr := &deviceConfig.ProxyAddress{
-		ConnType: connType,
-		Abstract: strings.HasPrefix(addr, "@"),
-	}
-
-	// unix addresses cannot have ports.
-	if newProxyAddr.ConnType == "unix" {
-		newProxyAddr.Address = addr
-
-		return newProxyAddr, nil
-	}
-
-	// Split <address> into <address> and <ports>.
-	address, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Validate that it's a valid address.
-	if slices.Contains([]string{"udp", "tcp"}, newProxyAddr.ConnType) {
-		err := validate.Optional(validate.IsNetworkAddress)(address)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	newProxyAddr.Address = address
-
-	// Split <ports> into individual ports and port ranges.
-	ports := strings.Split(port, ",")
-
-	newProxyAddr.Ports = make([]uint64, 0, len(ports))
-
-	for _, p := range ports {
-		portFirst, portRange, err := ParsePortRange(p)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := range portRange {
-			newProxyAddr.Ports = append(newProxyAddr.Ports, uint64(portFirst+i))
-		}
-	}
-
-	if len(newProxyAddr.Ports) <= 0 {
-		return nil, errors.New("At least one port is required")
-	}
-
-	return newProxyAddr, nil
+	return deviceConfig.ParseProxyAddress(data)
 }
 
 // AllowedUplinkNetworks returns a list of allowed networks to use as uplinks based on project restrictions.
