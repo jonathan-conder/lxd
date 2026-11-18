@@ -196,7 +196,7 @@ func TestParseAddr(t *testing.T) {
 	}
 }
 
-func testStreamPair(t *testing.T, network string) (proxy net.Conn, peer net.Conn) {
+func testStreamPair(t testing.TB, network string) (proxy net.Conn, peer net.Conn) {
 	t.Helper()
 
 	switch network {
@@ -232,6 +232,88 @@ func testStreamPair(t *testing.T, network string) (proxy net.Conn, peer net.Conn
 	default:
 		t.Fatalf("Unknown network %q", network)
 		return nil, nil
+	}
+}
+
+func BenchmarkProxyStreamCopy(b *testing.B) {
+	implementations := []struct {
+		name string
+		copy func(net.Conn, net.Conn) error
+	}{
+		{
+			name: "buffered",
+			copy: proxyCopy,
+		},
+		{
+			name: "io.Copy",
+			copy: func(dst net.Conn, src net.Conn) error {
+				_, err := io.Copy(dst, src)
+				return err
+			},
+		},
+	}
+
+	connections := []struct {
+		name string
+		src  string
+		dst  string
+	}{
+		{name: "TCP-TCP", src: "tcp", dst: "tcp"},
+		{name: "TCP-Unix", src: "tcp", dst: "unix"},
+		{name: "Unix-TCP", src: "unix", dst: "tcp"},
+	}
+
+	data := make([]byte, 16<<20)
+	for _, connection := range connections {
+		for _, implementation := range implementations {
+			b.Run(connection.name+"/"+implementation.name, func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(data)))
+
+				for range b.N {
+					srcProxy, srcPeer := testStreamPair(b, connection.src)
+					dstProxy, dstPeer := testStreamPair(b, connection.dst)
+
+					copyDone := make(chan error, 1)
+					go func() {
+						err := implementation.copy(dstProxy, srcProxy)
+						_ = dstProxy.(closeWriter).CloseWrite()
+						copyDone <- err
+					}()
+
+					readDone := make(chan error, 1)
+					go func() {
+						_, err := io.Copy(io.Discard, dstPeer)
+						readDone <- err
+					}()
+
+					_, err := srcPeer.Write(data)
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					err = srcPeer.(closeWriter).CloseWrite()
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					err = <-copyDone
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					err = <-readDone
+					if err != nil {
+						b.Fatal(err)
+					}
+
+					_ = srcProxy.Close()
+					_ = dstProxy.Close()
+					_ = srcPeer.Close()
+					_ = dstPeer.Close()
+				}
+			})
+		}
 	}
 }
 

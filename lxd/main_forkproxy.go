@@ -1429,7 +1429,13 @@ type closeWriter interface {
 
 func genericRelay(dst net.Conn, src net.Conn) {
 	relayer := func(src net.Conn, dst net.Conn, ch chan error) {
-		err := proxyCopy(src, dst)
+		var err error
+		_, isUDP := src.(*net.UDPConn)
+		if isUDP {
+			err = proxyCopy(src, dst)
+		} else {
+			_, err = io.Copy(src, dst)
+		}
 
 		// The copy reads from dst and writes to src. Half-close the write
 		// side of src without closing the opposite connection.
