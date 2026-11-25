@@ -83,8 +83,10 @@ GRUB default.
 This experiment uses QEMU 11.1.50 because
 the ROCm RFC does not apply to LXD 6.10.1's bundled QEMU 10.2.1. QEMU is
 built with rutabaga 1.90, patched with `patches/rutabaga-rocm.patch` to match
-the virglrenderer fork's ROCm flag and with `patches/qemu-rutabaga-rocm.patch`
-to add the `rocm` property to QEMU's rutabaga device. The
+the virglrenderer fork's ROCm flag and to fix the C `rutabaga_fence.ring_idx`
+type, which otherwise makes ring fences hang. `patches/qemu-rutabaga-capsets.patch`
+adds `virgl2` (OpenGL), `drm` (amdgpu native context) and `rocm` properties to
+QEMU's rutabaga device. The
 `install-snap` command connects this external QEMU to LXD; LXD 6.10.1 itself
 only requires QEMU 8.2.2 or newer.
 

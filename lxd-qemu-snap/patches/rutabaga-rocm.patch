@@ -1,5 +1,5 @@
 diff --git a/ffi/src/include/rutabaga_gfx_ffi.h b/ffi/src/include/rutabaga_gfx_ffi.h
-index 7efc12f..515dd86 100644
+index 7efc12f..45ade31 100644
 --- a/ffi/src/include/rutabaga_gfx_ffi.h
 +++ b/ffi/src/include/rutabaga_gfx_ffi.h
 @@ -41,6 +41,7 @@ extern "C" {
@@ -10,6 +10,16 @@ index 7efc12f..515dd86 100644
  
  /**
   * Blob resource creation parameters.
+@@ -233,7 +234,8 @@ struct rutabaga_fence {
+     uint32_t flags;
+     uint64_t fence_id;
+     uint32_t ctx_id;
+-    uint32_t ring_idx;
++    uint8_t ring_idx;
++    uint8_t padding[3];
+ };
+ 
+ struct rutabaga_debug {
 diff --git a/src/rutabaga_utils.rs b/src/rutabaga_utils.rs
 index 11e22c4..b497abd 100644
 --- a/src/rutabaga_utils.rs

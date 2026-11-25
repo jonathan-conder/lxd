@@ -304,7 +304,7 @@ parts:
       craftctl default
       b4 am -o - 20261106082711.813336-1-honghuan@amd.com |
         git -c user.name=Snapcraft -c user.email=snapcraft@localhost am
-      git apply "${CRAFT_PROJECT_DIR}/patches/qemu-rutabaga-rocm.patch"
+      git apply "${CRAFT_PROJECT_DIR}/patches/qemu-rutabaga-capsets.patch"
 
     override-build: |-
       [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0

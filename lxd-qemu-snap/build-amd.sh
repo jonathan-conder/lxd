@@ -6,7 +6,6 @@ build_dir="${snap_dir}/build"
 
 instance=amd-rocm
 kernel_release=7.0.0-44-rocm-virtio
-render_node=/dev/dri/renderD128
 rocm_version=7.14.0
 rocm_gfx=gfx1150
 venv=/opt/rocm-virtio
@@ -42,10 +41,8 @@ case "${1:-}" in
                 -c limits.cpu=8 \
                 -c limits.memory=16GiB \
                 -d root,size=64GiB \
-                -c raw.qemu="-display egl-headless,rendernode=${render_node}" \
                 -c raw.qemu.conf='[device "qemu_gpu"]
-driver = "virtio-vga-gl"
-blob = "true"
+driver = "virtio-vga-rutabaga"
 hostmem = "16G"
 rocm = "true"' \
                 -c raw.apparmor='/snap/lxd/*/gpu-2604/** mr,
