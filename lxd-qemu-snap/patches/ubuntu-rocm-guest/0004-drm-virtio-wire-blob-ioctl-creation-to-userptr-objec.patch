@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Honglei Huang <honghuan@amd.com>
+Date: Fri, 6 Nov 2026 16:26:25 +0800
+Subject: [PATCH 4/4] drm/virtio: wire blob ioctl creation to userptr objects
+
+Integrate userptr into the blob resource creation ioctl.
+
+- A non-zero userptr selects virtio_gpu_userptr_create()
+- Reject userptr unless blob_mem is VIRTGPU_BLOB_MEM_GUEST
+- Reject VIRTGPU_BLOB_FLAG_USE_READONLY unless the device
+  advertised VIRTIO_GPU_F_BLOB_READONLY
+- Advertise VIRTGPU_PARAM_USERPTR and VIRTGPU_PARAM_BLOB_READONLY
+- Add VIRTIO_GPU_F_BLOB_READONLY to the driver's features[] array
+
+Signed-off-by: Honglei Huang <honghuan@amd.com>
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_debugfs.c b/drivers/gpu/drm/virtio/virtgpu_debugfs.c
+index 3a68a16b5..b8b9b4058 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_debugfs.c
++++ b/drivers/gpu/drm/virtio/virtgpu_debugfs.c
+@@ -55,6 +55,7 @@ static int virtio_gpu_features(struct seq_file *m, void *data)
+ 			    vgdev->has_resource_assign_uuid);
+ 
+ 	virtio_gpu_add_bool(m, "blob resources", vgdev->has_resource_blob);
++	virtio_gpu_add_bool(m, "blob readonly", vgdev->has_blob_readonly);
+ 	virtio_gpu_add_bool(m, "context init", vgdev->has_context_init);
+ 	virtio_gpu_add_int(m, "cap sets", vgdev->num_capsets);
+ 	virtio_gpu_add_int(m, "scanouts", vgdev->num_scanouts);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.c b/drivers/gpu/drm/virtio/virtgpu_drv.c
+index 9af740bda..8cca96918 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -166,6 +166,8 @@ static unsigned int features[] = {
+ 	VIRTIO_GPU_F_RESOURCE_UUID,
+ 	VIRTIO_GPU_F_RESOURCE_BLOB,
+ 	VIRTIO_GPU_F_CONTEXT_INIT,
++	VIRTIO_GPU_F_BLOB_ALIGNMENT,
++	VIRTIO_GPU_F_BLOB_READONLY,
+ };
+ static struct virtio_driver virtio_gpu_driver = {
+ 	.feature_table = features,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index b3a75e55d..98807cf17 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -104,6 +104,7 @@ struct virtio_gpu_object_params {
+ 	uint32_t blob_mem;
+ 	uint32_t blob_flags;
+ 	uint64_t blob_id;
++	uint32_t blob_hints;
+ 	uint64_t userptr;
+ };
+ 
+@@ -328,6 +329,7 @@ struct virtio_gpu_device {
+ 	uint32_t num_capsets;
+ 	uint64_t capset_id_mask;
+ 	struct list_head cap_cache;
++	uint32_t blob_alignment;
+ 
+ 	/* protects uuid state when exporting */
+ 	spinlock_t resource_export_lock;
+diff --git a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+index 86777a7d4..f50d00911 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+@@ -36,7 +36,10 @@
+ 
+ #define VIRTGPU_BLOB_FLAG_USE_MASK (VIRTGPU_BLOB_FLAG_USE_MAPPABLE | \
+ 				    VIRTGPU_BLOB_FLAG_USE_SHAREABLE | \
+-				    VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE)
++				    VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE | \
++				    VIRTGPU_BLOB_FLAG_USE_READONLY)
++
++#define VIRTGPU_BLOB_HINT_MASK DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING
+ 
+ /* Must be called with &virtio_gpu_fpriv.struct_mutex held. */
+ static void virtio_gpu_create_context_locked(struct virtio_gpu_device *vgdev,
+@@ -117,6 +120,17 @@ static int virtio_gpu_getparam_ioctl(struct drm_device *dev, void *data,
+ 	case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME:
+ 		value = vgdev->has_context_init ? 1 : 0;
+ 		break;
++	case VIRTGPU_PARAM_BLOB_ALIGNMENT:
++		if (!vgdev->has_blob_alignment)
++			return -ENOENT;
++		value = vgdev->blob_alignment;
++		break;
++	case VIRTGPU_PARAM_USERPTR:
++		value = 1;
++		break;
++	case VIRTGPU_PARAM_BLOB_READONLY:
++		value = vgdev->has_blob_readonly ? 1 : 0;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -491,11 +505,23 @@ static int verify_blob(struct virtio_gpu_device *vgdev,
+ 	if (rc_blob->blob_flags & ~VIRTGPU_BLOB_FLAG_USE_MASK)
+ 		return -EINVAL;
+ 
++	if (rc_blob->blob_hints & ~VIRTGPU_BLOB_HINT_MASK)
++		return -EINVAL;
++
+ 	if (rc_blob->blob_flags & VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE) {
+ 		if (!vgdev->has_resource_assign_uuid)
+ 			return -EINVAL;
+ 	}
+ 
++	if (rc_blob->blob_flags & VIRTGPU_BLOB_FLAG_USE_READONLY) {
++		if (!vgdev->has_blob_readonly)
++			return -EINVAL;
++	}
++
++	if (rc_blob->userptr &&
++	    rc_blob->blob_mem != VIRTGPU_BLOB_MEM_GUEST)
++		return -EINVAL;
++
+ 	switch (rc_blob->blob_mem) {
+ 	case VIRTGPU_BLOB_MEM_GUEST:
+ 		*guest_blob = true;
+@@ -532,6 +558,17 @@ static int verify_blob(struct virtio_gpu_device *vgdev,
+ 	params->size = rc_blob->size;
+ 	params->blob = true;
+ 	params->blob_flags = rc_blob->blob_flags;
++	params->blob_hints = rc_blob->blob_hints;
++	params->userptr = rc_blob->userptr;
++
++	if (vgdev->has_blob_alignment) {
++		if (!IS_ALIGNED(params->size, vgdev->blob_alignment))
++			return -EINVAL;
++
++		if (!IS_ALIGNED(params->userptr, vgdev->blob_alignment))
++			return -EINVAL;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -550,9 +587,10 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
+ 	struct virtio_gpu_fpriv *vfpriv = file->driver_priv;
+ 	struct drm_virtgpu_resource_create_blob *rc_blob = data;
+ 
+-	if (verify_blob(vgdev, vfpriv, &params, rc_blob,
+-			&guest_blob, &host3d_blob))
+-		return -EINVAL;
++	ret = verify_blob(vgdev, vfpriv, &params, rc_blob,
++			  &guest_blob, &host3d_blob);
++	if (ret)
++		return ret;
+ 
+ 	if (vgdev->has_virgl_3d)
+ 		virtio_gpu_create_context(dev, file);
+@@ -570,7 +608,9 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
+ 				      vfpriv->ctx_id, NULL, NULL);
+ 	}
+ 
+-	if (guest_blob)
++	if (guest_blob && params.userptr)
++		ret = virtio_gpu_userptr_create(vgdev, file, &params, &bo);
++	else if (guest_blob)
+ 		ret = virtio_gpu_object_create(vgdev, &params, &bo, NULL);
+ 	else if (!guest_blob && host3d_blob)
+ 		ret = virtio_gpu_vram_create(vgdev, &params, &bo);
+diff --git a/drivers/gpu/drm/virtio/virtgpu_kms.c b/drivers/gpu/drm/virtio/virtgpu_kms.c
+index b79fd8350..990ef7823 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c
+@@ -127,7 +127,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
+ 	struct virtio_gpu_device *vgdev;
+ 	/* this will expand later */
+ 	struct virtqueue *vqs[2];
+-	u32 num_scanouts, num_capsets;
++	u32 num_scanouts, num_capsets, blob_alignment;
+ 	int ret = 0;
+ 
+ 	if (!virtio_has_feature(vdev, VIRTIO_F_VERSION_1))
+@@ -201,14 +201,26 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
+ 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
+ 		vgdev->has_context_init = true;
+ 
++	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_BLOB_ALIGNMENT)) {
++		vgdev->has_blob_alignment = true;
++		virtio_cread_le(vgdev->vdev, struct virtio_gpu_config,
++				blob_alignment, &blob_alignment);
++		vgdev->blob_alignment = blob_alignment;
++	}
++
++	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_BLOB_READONLY))
++		vgdev->has_blob_readonly = true;
++
+ 	DRM_INFO("features: %cvirgl %cedid %cresource_blob %chost_visible",
+ 		 vgdev->has_virgl_3d    ? '+' : '-',
+ 		 vgdev->has_edid        ? '+' : '-',
+ 		 vgdev->has_resource_blob ? '+' : '-',
+ 		 vgdev->has_host_visible ? '+' : '-');
+ 
+-	DRM_INFO("features: %ccontext_init\n",
+-		 vgdev->has_context_init ? '+' : '-');
++	DRM_INFO("features: %ccontext_init %cblob_alignment %cblob_readonly\n",
++		 vgdev->has_context_init ? '+' : '-',
++		 vgdev->has_blob_alignment ? '+' : '-',
++		 vgdev->has_blob_readonly ? '+' : '-');
+ 
+ 	ret = virtio_find_vqs(vgdev->vdev, 2, vqs, vqs_info, NULL);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/virtio/virtgpu_userptr.c b/drivers/gpu/drm/virtio/virtgpu_userptr.c
+index c1922a869..3e5d34db6 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_userptr.c
++++ b/drivers/gpu/drm/virtio/virtgpu_userptr.c
+@@ -21,8 +21,7 @@ static void virtio_gpu_userptr_free(struct drm_gem_object *obj)
+ 	 * calls virtio_gpu_cleanup_object to drop them.
+ 	 */
+ 	if (bo->created) {
+-		virtio_gpu_remove_from_restore_list(bo);
+-		virtio_gpu_cmd_unref_resource(vgdev, bo, false);
++		virtio_gpu_cmd_unref_resource(vgdev, bo);
+ 		virtio_gpu_notify(vgdev);
+ 		return;
+ 	}
+@@ -233,8 +232,6 @@ virtio_gpu_userptr_init(struct drm_device *dev, struct drm_file *file,
+ 	obj->funcs = &virtio_gpu_userptr_funcs;
+ 
+ 	drm_gem_private_object_init(dev, obj, params->size);
+-	INIT_LIST_HEAD(&userptr->base.restore_node);
+-
+ 	return 0;
+ }
+ 
+@@ -338,7 +335,6 @@ int virtio_gpu_userptr_create(struct virtio_gpu_device *vgdev,
+ 	virtio_gpu_cmd_resource_create_blob(vgdev, &userptr->base, params, ents,
+ 					    nents);
+ 
+-	userptr->base.params = *params;
+ 
+ 	*bo_ptr = &userptr->base;
+ 	return 0;
+diff --git a/include/uapi/drm/virtgpu_drm.h b/include/uapi/drm/virtgpu_drm.h
+index 74bd696f7..75e9e0a00 100644
+--- a/include/uapi/drm/virtgpu_drm.h
++++ b/include/uapi/drm/virtgpu_drm.h
+@@ -205,6 +205,10 @@ struct drm_virtgpu_resource_create_blob {
+ 	__u32 cmd_size;
+ 	__u64 cmd;
+ 	__u64 blob_id;
++#define DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING 0x0001
++	__u32 blob_hints;
++	__u32 pad2;
++
+ 	/*
+ 	 * Non-zero selects the userptr path and is valid only with
+ 	 * VIRTGPU_BLOB_MEM_GUEST. Must be 0 otherwise. Probe
+diff --git a/include/uapi/linux/virtio_gpu.h b/include/uapi/linux/virtio_gpu.h
+index 7e939515e..1f765f361 100644
+--- a/include/uapi/linux/virtio_gpu.h
++++ b/include/uapi/linux/virtio_gpu.h
+@@ -374,6 +374,7 @@ struct virtio_gpu_config {
+ 	__le32 events_clear;
+ 	__le32 num_scanouts;
+ 	__le32 num_capsets;
++	__le32 blob_alignment;
+ };
+ 
+ /* simple formats for fbcon/X use */
+-- 
+2.43.0
+

@@ -1,0 +1,2792 @@
+diff --git a/projects/rocr-runtime/CMakeLists.txt b/projects/rocr-runtime/CMakeLists.txt
+index 8f64556bcd..62e9c83ca5 100644
+--- a/projects/rocr-runtime/CMakeLists.txt
++++ b/projects/rocr-runtime/CMakeLists.txt
+@@ -113,7 +113,7 @@ if (HSA_DEP_ROCPROFILER_REGISTER)
+ endif()
+ 
+ if (NOT DEFINED BUILD_THUNK_VIRTIO)
+-  set(BUILD_THUNK_VIRTIO OFF)
++  set(BUILD_THUNK_VIRTIO ON)
+ endif()
+ 
+ add_rocm_subdir(libhsakmt "${THUNK_DEFINITIONS}")
+diff --git a/projects/rocr-runtime/libhsakmt/include/hsakmt/hsakmt_virtio.h b/projects/rocr-runtime/libhsakmt/include/hsakmt/hsakmt_virtio.h
+index 3c29d7fd03..e12218e8ae 100644
+--- a/projects/rocr-runtime/libhsakmt/include/hsakmt/hsakmt_virtio.h
++++ b/projects/rocr-runtime/libhsakmt/include/hsakmt/hsakmt_virtio.h
+@@ -197,6 +197,9 @@ int vamdgpu_bo_va_op(amdgpu_bo_handle bo, uint64_t offset, uint64_t size, uint64
+ int vamdgpu_bo_query_info(amdgpu_bo_handle bo, struct amdgpu_bo_info* info);
+ int vamdgpu_bo_set_metadata(amdgpu_bo_handle bo, struct amdgpu_bo_metadata* info);
+ 
++HSAKMT_STATUS HSAKMTAPI vhsaKmtVirtioMapHandleToVA(void* MemoryHandle, void* Va, HSAuint64 Size);
++HSAKMT_STATUS HSAKMTAPI vhsaKmtVirtioUnmapHandleFromVA(void* Va, HSAuint64 Size);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_amdgpu.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_amdgpu.c
+index 06e7d92237..7a161e001e 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_amdgpu.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_amdgpu.c
+@@ -22,6 +22,23 @@
+ 
+ #include "hsakmt/hsakmt_virtio.h"
+ #include "hsakmt_virtio_device.h"
++#include <limits.h>
++
++static uint64_t vhsakmt_drm_device_id(vhsakmt_device_handle dev,
++                                    amdgpu_device_handle handle) {
++  uint64_t device_id = 0;
++
++  if (!handle || !dev->sys_props || !dev->vhsakmt_nodes) return 0;
++  pthread_mutex_lock(&dev->vhsakmt_mutex);
++  for (uint32_t index = 0; index < dev->sys_props->NumNodes; index++) {
++    if (dev->vhsakmt_nodes[index].amdgpu_device_handle == handle) {
++      device_id = dev->vhsakmt_nodes[index].drm_device_id;
++      break;
++    }
++  }
++  pthread_mutex_unlock(&dev->vhsakmt_mutex);
++  return device_id;
++}
+ 
+ /* amdgpu device initialize/deinitialize will be called in vhsakmtopen 
+  * so just return ENOSYS here to avoid duplicate implementation
+@@ -38,34 +55,43 @@ int vamdgpu_query_gpu_info(amdgpu_device_handle handle, void* out) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
++  uint64_t device_id = vhsakmt_drm_device_id(dev, handle);
++  if (!device_id || !out) return -EINVAL;
+   struct vhsakmt_ccmd_query_info_rsp* rsp;
+   struct vhsakmt_ccmd_query_info_req req = {
+       .hdr = VHSAKMT_CCMD(QUERY_INFO, sizeof(struct vhsakmt_ccmd_query_info_req)),
+       .type = VHSAKMT_CCMD_QUERY_GPU_INFO,
++      .drm_command_args = {
++          .device_id = device_id,
++          .version = VHSAKMT_DRM_PROTOCOL_VERSION,
++      },
+   };
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_query_info_rsp));
+   if (!rsp) return -ENOMEM;
+ 
++  rsp->ret = -EOPNOTSUPP;
+   int ret = vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-
+-  if (!ret) memcpy(out, &rsp->gpu_info, sizeof(struct amdgpu_gpu_info));
+-
+-  return ret;
++  if (ret) return ret;
++  if (rsp->ret) return rsp->ret;
++  if (rsp->hdr.len < sizeof(*rsp)) return -EIO;
++  memcpy(out, &rsp->gpu_info, sizeof(struct amdgpu_gpu_info));
++  return 0;
+ }
+ 
+ int vamdgpu_device_get_fd(amdgpu_device_handle device_handle) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+-  struct vhsakmt_node* node = NULL;
+   int fd = -1;
++
++  if (!device_handle || !dev->sys_props || !dev->vhsakmt_nodes) return -EBADF;
+   
+   pthread_mutex_lock(&dev->vhsakmt_mutex);
+   for (uint32_t i = 0; i < dev->sys_props->NumNodes; i++) {
+-    if (dev->vhsakmt_nodes[i].amdgpu_device_handle == device_handle) {
+-      node = &dev->vhsakmt_nodes[i];
+-      fd = node->amdgpu_fd;
++    if (dev->vhsakmt_nodes[i].amdgpu_device_handle == device_handle &&
++        dev->vhsakmt_nodes[i].drm_device_id) {
++      fd = dev->vhsakmt_nodes[i].amdgpu_fd;
+       break;
+     }
+   }
+@@ -77,50 +103,67 @@ int vamdgpu_device_get_fd(amdgpu_device_handle device_handle) {
+ int vdrmCommandWriteRead(int fd, unsigned long drmCommandIndex, void* data, unsigned long size) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
+-  if (size > VHSAKMT_CCMD_QUERY_DRM_CMD_WRITE_READ_MAX_SIZE)
++  if (drmCommandIndex != DRM_AMDGPU_INFO) return -EOPNOTSUPP;
++  if (!data || size != sizeof(struct drm_amdgpu_info)) return -EINVAL;
++
++  const struct drm_amdgpu_info* info = data;
++  if (!info->return_pointer || !info->return_size ||
++      info->return_size > VHSAKMT_DRM_INFO_MAX_SIZE)
+     return -EINVAL;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
++  uint64_t device_id = 0;
++  if (fd < 0 || !dev->sys_props || !dev->vhsakmt_nodes) return -EBADF;
++  pthread_mutex_lock(&dev->vhsakmt_mutex);
++  for (uint32_t index = 0; index < dev->sys_props->NumNodes; index++) {
++    if (dev->vhsakmt_nodes[index].amdgpu_device_handle &&
++        dev->vhsakmt_nodes[index].amdgpu_fd == fd) {
++      device_id = dev->vhsakmt_nodes[index].drm_device_id;
++      break;
++    }
++  }
++  pthread_mutex_unlock(&dev->vhsakmt_mutex);
++  if (!device_id) return -EBADF;
++
+   struct vhsakmt_ccmd_query_info_rsp* rsp;
+   struct vhsakmt_ccmd_query_info_req req = {
+-      .hdr = VHSAKMT_CCMD(QUERY_INFO, sizeof(struct vhsakmt_ccmd_query_info_req) + size),
+-      .type = VHSAKMT_CCMD_QUERY_DRM_CMD_WRITE_READ,
+-      .drm_cmd_write_read_args =
+-          {
+-              .fd = fd,
+-              .drmCommandIndex = drmCommandIndex,
+-              .size = size,
+-          },
++      .hdr = VHSAKMT_CCMD(QUERY_INFO, sizeof(req)),
++      .info = *info,
++      .type = VHSAKMT_CCMD_QUERY_DRM_COMMAND,
++      .drm_command_args = {
++          .device_id = device_id,
++          .version = VHSAKMT_DRM_PROTOCOL_VERSION,
++          .command = DRM_AMDGPU_INFO,
++      },
+   };
++  req.info.return_pointer = 0;
+ 
+-  memcpy(req.payload, data, size);
+-
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr,
+-                          sizeof(struct vhsakmt_ccmd_query_info_rsp) + size);
++  uint32_t response_size = sizeof(*rsp) + info->return_size;
++  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, response_size);
+   if (!rsp) return -ENOMEM;
++  rsp->ret = -EOPNOTSUPP;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  int ret = vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  if (ret) return ret;
+   if (rsp->ret) return rsp->ret;
++  if (rsp->hdr.len < response_size) return -EIO;
+ 
+-  memcpy(data, rsp->payload, size);
+-
+-  return rsp->ret;
++  memcpy((void*)(uintptr_t)info->return_pointer, rsp->payload, info->return_size);
++  return 0;
+ }
+ 
+ HSAKMT_STATUS vhsaKmtGetAMDGPUDeviceHandle(HSAuint32 NodeId, HsaAMDGPUDeviceHandle* DeviceHandle) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
++  if (!DeviceHandle) return HSAKMT_STATUS_INVALID_PARAMETER;
++  *DeviceHandle = NULL;
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   struct vhsakmt_node* node = vhsakmt_get_node_by_id(dev, NodeId);
+-  if (!node) return HSAKMT_STATUS_INVALID_HANDLE;
+-
+-  if (node->amdgpu_device_handle) {
+-    *DeviceHandle = node->amdgpu_device_handle;
+-    return HSAKMT_STATUS_SUCCESS;
+-  }
++  if (!node || !node->node_props.KFDGpuID || NodeId >= INT_MAX)
++    return HSAKMT_STATUS_INVALID_HANDLE;
+ 
+   pthread_mutex_lock(&dev->vhsakmt_mutex);
+-  if (node->amdgpu_device_handle) {
++  if (node->amdgpu_device_handle && node->drm_device_id) {
+     *DeviceHandle = node->amdgpu_device_handle;
+     pthread_mutex_unlock(&dev->vhsakmt_mutex);
+     return HSAKMT_STATUS_SUCCESS;
+@@ -129,8 +172,11 @@ HSAKMT_STATUS vhsaKmtGetAMDGPUDeviceHandle(HSAuint32 NodeId, HsaAMDGPUDeviceHand
+   struct vhsakmt_ccmd_query_info_rsp* rsp;
+   struct vhsakmt_ccmd_query_info_req req = {
+       .hdr = VHSAKMT_CCMD(QUERY_INFO, sizeof(struct vhsakmt_ccmd_query_info_req)),
+-      .type = VHSAKMT_CCMD_QUERY_AMDGPU_DEVICE_HANDLE,
+-      .NodeID = NodeId,
++      .type = VHSAKMT_CCMD_QUERY_DRM_DEVICE,
++      .drm_device_args = {
++          .NodeId = NodeId,
++          .version = VHSAKMT_DRM_PROTOCOL_VERSION,
++      },
+   };
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_query_info_rsp));
+@@ -139,14 +185,24 @@ HSAKMT_STATUS vhsaKmtGetAMDGPUDeviceHandle(HSAuint32 NodeId, HsaAMDGPUDeviceHand
+     return -ENOMEM;
+   }
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  
+-  node->amdgpu_device_handle = (void*)rsp->device_handle_rsp.amdgpu_device_handle;
+-  node->amdgpu_fd = (int)rsp->device_handle_rsp.fd;
+-  pthread_mutex_unlock(&dev->vhsakmt_mutex);
++  rsp->ret = -EOPNOTSUPP;
++  memset(&rsp->drm_device_rsp, 0, sizeof(rsp->drm_device_rsp));
++  int ret = vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  if (!ret) ret = rsp->ret;
++  if (!ret && (rsp->hdr.len < sizeof(*rsp) ||
++               rsp->drm_device_rsp.version != VHSAKMT_DRM_PROTOCOL_VERSION ||
++               !(rsp->drm_device_rsp.commands & VHSAKMT_DRM_COMMAND_INFO) ||
++               !rsp->drm_device_rsp.device_id))
++    ret = -EOPNOTSUPP;
++  if (!ret) {
++    node->drm_device_id = rsp->drm_device_rsp.device_id;
++    node->amdgpu_device_handle = (HsaAMDGPUDeviceHandle)node;
++    node->amdgpu_fd = INT_MAX - (int)NodeId;
++    *DeviceHandle = node->amdgpu_device_handle;
++  }
+ 
+-  *DeviceHandle = node->amdgpu_device_handle;
+-  return rsp->ret;
++  pthread_mutex_unlock(&dev->vhsakmt_mutex);
++  return ret;
+ }
+ 
+ int vamdgpu_bo_cpu_map(amdgpu_bo_handle buf_handle, void** cpu) {
+@@ -248,13 +304,16 @@ int vamdgpu_bo_import(amdgpu_device_handle dev, enum amdgpu_bo_handle_type type,
+   vhsakmt_device_handle vdev = vhsakmt_dev();
+   vhsakmt_bo_handle obj;
+   uint32_t bo_handle, res_id;
++  uint64_t device_id = vhsakmt_drm_device_id(vdev, dev);
+   int r;
+ 
+-  if (type != amdgpu_bo_handle_type_dma_buf_fd) {
++  if (!dev || !output || !vdev->sys_props || type != amdgpu_bo_handle_type_dma_buf_fd) {
+     vhsa_err("%s: unsupported import type: %u\n", __FUNCTION__, type);
+     return -EINVAL;
+   }
+ 
++  if (!device_id) return -EBADF;
++
+   r = vhsakmt_handle_to_resid(vdev, shared_handle, &res_id, &bo_handle);
+   if (r) return r;
+ 
+@@ -268,7 +327,7 @@ int vamdgpu_bo_import(amdgpu_device_handle dev, enum amdgpu_bo_handle_type type,
+       .res_id = res_id,
+       .amdgpu_import_args =
+           {
+-              .dev = (int64_t)dev,
++              .device_id = device_id,
+               .type = (uint32_t)type,
+               .shared_handle = shared_handle,
+           },
+@@ -277,8 +336,11 @@ int vamdgpu_bo_import(amdgpu_device_handle dev, enum amdgpu_bo_handle_type type,
+   rsp = vhsakmt_alloc_rsp(vdev, &req.hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(vdev, &req.hdr, __FUNCTION__);
++  rsp->ret = -EOPNOTSUPP;
++  r = vhsakmt_execbuf_cpu(vdev, &req.hdr, __FUNCTION__);
++  if (r) return r;
+   if (rsp->ret) return rsp->ret;
++  if (rsp->hdr.len < sizeof(*rsp)) return -EIO;
+ 
+   pthread_mutex_lock(&obj->amdgpu_bo.lock);
+   if (obj->amdgpu_bo.imported) {
+@@ -290,7 +352,7 @@ int vamdgpu_bo_import(amdgpu_device_handle dev, enum amdgpu_bo_handle_type type,
+     return HSAKMT_STATUS_SUCCESS;
+   }
+ 
+-  memcpy(output, &rsp->amdgpu_import_rsp.output, sizeof(struct amdgpu_bo_import_result));
++  output->alloc_size = rsp->amdgpu_import_rsp.output.alloc_size;
+ 
+   obj->bo_type |= VHSA_BO_AMDGPU;
+   obj->amdgpu_bo.imported = true;
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.c
+index 4e7aed500a..ee3ed02059 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.c
+@@ -24,10 +24,74 @@
+ 
+ #include "hsakmt_virtio_device.h"
+ 
++int vhsakmt_require_wire_features(vhsakmt_device_handle dev, uint64_t features) {
++  int ret = 0;
++
++  pthread_mutex_lock(&dev->vhsakmt_mutex);
++  if (!dev->wire_features_valid) {
++    struct vhsakmt_ccmd_query_info_req req = {
++        .hdr = VHSAKMT_CCMD(QUERY_INFO, sizeof(req)),
++        .type = VHSAKMT_CCMD_QUERY_OPEN_KFD,
++        .open_kfd_args.cur_vm_start = dev->vm_start,
++    };
++    struct vhsakmt_ccmd_query_info_rsp* rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(*rsp));
++    if (!rsp) {
++      ret = -ENOMEM;
++    } else {
++      rsp->ret = -EOPNOTSUPP;
++      memset(&rsp->open_kfd_rsp, 0, sizeof(rsp->open_kfd_rsp));
++      ret = vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++      if (!ret) ret = rsp->ret;
++      if (!ret && rsp->hdr.len < sizeof(*rsp)) ret = -EOPNOTSUPP;
++      if (!ret) {
++        dev->wire_features = rsp->open_kfd_rsp.features;
++        dev->wire_features_valid = true;
++      }
++    }
++  }
++  if (!ret && (dev->wire_features & features) != features) ret = -EOPNOTSUPP;
++  pthread_mutex_unlock(&dev->vhsakmt_mutex);
++  return ret;
++}
++
++int vhsakmt_require_wire_pointers(vhsakmt_device_handle dev) {
++  return vhsakmt_require_wire_features(dev, VHSAKMT_WIRE_FEATURE_POINTERS_V2);
++}
++
+ int vhsakmt_execbuf_cpu(vhsakmt_device_handle dev, struct vhsakmt_ccmd_req* req, const char* from) {
+   return virtio_gpu_exec_cmd(dev->vgdev, req, true);
+ }
+ 
++int vhsakmt_execbuf_rsp(vhsakmt_device_handle dev, struct vhsakmt_ccmd_req* req,
++                       const struct vhsakmt_ccmd_rsp* rsp, uint32_t size, const char* from) {
++  int32_t status;
++  if (!rsp || size < sizeof(*rsp) + sizeof(status) || size > UINT32_MAX - 7)
++    return -EINVAL;
++
++  int ret = vhsakmt_execbuf_cpu(dev, req, from);
++  if (ret) return ret;
++  if (rsp->len < size || rsp->len > VHSA_ALIGN_UP(size, 8)) return -EPROTO;
++  memcpy(&status, (const char*)rsp + sizeof(*rsp), sizeof(status));
++  return status;
++}
++
+ void* vhsakmt_alloc_rsp(vhsakmt_device_handle dev, struct vhsakmt_ccmd_req* req, uint32_t sz) {
+-  return virtio_gpu_alloc_rsp(dev->vgdev, req, sz);
++  _Static_assert(offsetof(struct vhsakmt_ccmd_query_info_rsp, ret) == sizeof(struct vhsakmt_ccmd_rsp), "query status layout");
++  _Static_assert(offsetof(struct vhsakmt_ccmd_event_rsp, ret) == sizeof(struct vhsakmt_ccmd_rsp), "event status layout");
++  _Static_assert(offsetof(struct vhsakmt_ccmd_memory_rsp, ret) == sizeof(struct vhsakmt_ccmd_rsp), "memory status layout");
++  _Static_assert(offsetof(struct vhsakmt_ccmd_queue_rsp, ret) == sizeof(struct vhsakmt_ccmd_rsp), "queue status layout");
++  _Static_assert(offsetof(struct vhsakmt_ccmd_gl_inter_rsp, ret) == sizeof(struct vhsakmt_ccmd_rsp), "graphics status layout");
++
++  const int32_t failure = HSAKMT_STATUS_ERROR;
++  if (sz < sizeof(struct vhsakmt_ccmd_rsp) + sizeof(failure) || sz > UINT32_MAX - 7)
++    return NULL;
++  uint32_t size = VHSA_ALIGN_UP(sz, 8);
++  if (!dev->vgdev->rsp_mem || size > dev->vgdev->rsp_mem_len) return NULL;
++
++  struct vhsakmt_ccmd_rsp* rsp = virtio_gpu_alloc_rsp(dev->vgdev, req, size);
++  if (!rsp) return NULL;
++  memset(rsp, 0, size);
++  rsp->len = size;
++  memcpy((char*)rsp + sizeof(*rsp), &failure, sizeof(failure));
++  return rsp;
+ }
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.h b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.h
+index d9f962ba0f..ad613cdd05 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.h
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_device.h
+@@ -95,12 +95,13 @@ struct vhsakmt_node {
+   uint64_t scratch_start;
+   uint64_t scratch_size;
+   HsaAMDGPUDeviceHandle amdgpu_device_handle;
++  uint64_t drm_device_id;
+   int amdgpu_fd;
+ };
+ 
+ struct vhsakmt_device {
+   struct virtio_gpu_device* vgdev;
+-  int refcount;
++  _Atomic int refcount;
+   pthread_mutex_t bo_handles_mutex;
+   rbtree_t bo_rbt;
+   interval_tree_t userptr_tree;
+@@ -108,7 +109,7 @@ struct vhsakmt_device {
+   struct vhsakmt_bo* shmem_bo;
+ 
+   uint32_t reqbuf_max;
+-  uint32_t next_blob_id;
++  _Atomic uint32_t next_blob_id;
+ 
+   uint64_t vm_start;
+   uint64_t vm_size;
+@@ -118,15 +119,19 @@ struct vhsakmt_device {
+   HsaSystemProperties* sys_props;
+ 
+   bool use_svm;
++  bool userptr_enabled;
++  bool wire_features_valid;
++  uint64_t wire_features;
+ };
+ 
+ struct vhsakmt_bo {
+   rbtree_node_t rbtn;
+   interval_tree_node_t itn;
++  bool in_itree;
+   struct vhsakmt_device* dev;
+ 
+-  int refcount;
+-  unsigned size;
++  _Atomic int refcount;
++  uint64_t size;   /* was unsigned (32-bit): truncated >=4GB allocs -> mmap(0)=EINVAL */
+   void* cpu_addr;
+   void* host_addr;
+   HsaMemFlags flags;
+@@ -140,7 +145,7 @@ struct vhsakmt_bo {
+       uint32_t res_id;
+       uint64_t offset;
+       uint64_t alloc_size;
+-      int map_count;
++      _Atomic int map_count;
+     } real;
+   };
+ 
+@@ -152,11 +157,13 @@ struct vhsakmt_bo {
+     void* gl_meta_data;
+     uint64_t import_size;
+     bool imported : 1;
+-    int refcount;
++    _Atomic int refcount;
+     pthread_mutex_t lock;  /* protects imported, import_size and refcount operations */
+   } amdgpu_bo;
+ 
+   void* user_data;
++  HSAuint32 registered_nodes[VHSAKMT_MEMORY_MAX_NODES];
++  HSAuint32 mapped_nodes[VHSAKMT_MEMORY_MAX_NODES];
+ };
+ 
+ /*hsakmt_virtio_memory.c*/
+@@ -195,12 +202,16 @@ bool vhsakmt_is_userptr(vhsakmt_device_handle dev, void* addr);
+ struct vhsakmt_node* vhsakmt_get_node_by_id(vhsakmt_device_handle dev, uint32_t node_id);
+ 
+ /*hsakmt_virtio_device.c*/
++int vhsakmt_require_wire_features(vhsakmt_device_handle dev, uint64_t features);
++int vhsakmt_require_wire_pointers(vhsakmt_device_handle dev);
+ int vhsakmt_execbuf_cpu(vhsakmt_device_handle dev, struct vhsakmt_ccmd_req* req, const char* from);
++int vhsakmt_execbuf_rsp(vhsakmt_device_handle dev, struct vhsakmt_ccmd_req* req,
++                       const struct vhsakmt_ccmd_rsp* rsp, uint32_t size, const char* from);
+ void* vhsakmt_alloc_rsp(vhsakmt_device_handle dev, struct vhsakmt_ccmd_req* req, uint32_t sz);
+ int vhsakmt_handle_to_resid(vhsakmt_device_handle dev, uint32_t handle, uint32_t* res_id, uint32_t* bo_handle);
+ 
+ /*hsakmt_virtio_event.c*/
+-void* vhsakmt_event_host_handle(HsaEvent* h);
++uint32_t vhsakmt_event_res_id(HsaEvent* event);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_events.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_events.c
+index e7ee49cbed..eafbbf536c 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_events.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_events.c
+@@ -25,9 +25,9 @@
+ 
+ int vhsakmt_debug_level;
+ 
+-void* vhsakmt_event_host_handle(HsaEvent* h) { return (void*)((vHsaEvent*)h)->event_handle; }
+-
+-static inline int32_t vhsakmt_event_res_id(HsaEvent* h) { return ((vHsaEvent*)h)->res_id; }
++uint32_t vhsakmt_event_res_id(HsaEvent* event) {
++  return event ? ((vHsaEvent*)event)->res_id : 0;
++}
+ 
+ static inline vhsakmt_bo_handle vhsakmt_event_bo_handle(HsaEvent* h) {
+   return (vhsakmt_bo_handle)((vHsaEvent*)h)->bo_handle;
+@@ -38,7 +38,7 @@ static int vhsakmt_create_event_blob_bo(vhsakmt_device_handle dev, size_t size,
+   int r;
+ 
+   r = vhsakmt_init_host_blob(dev, size, VIRTGPU_BLOB_MEM_HOST3D, 0, blob_id, VHSA_BO_EVENT,
+-                             (void*)vevent_handle->event_handle, bo_handle);
++                             NULL, bo_handle);
+   if (r) return r;
+ 
+   (*bo_handle)->event = vevent_handle;
+@@ -52,15 +52,19 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateEvent(HsaEventDescriptor* EventDesc, _Bool
+                                            _Bool IsSignaled, HsaEvent** Event) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
++  if (!EventDesc || !Event) return HSAKMT_STATUS_INVALID_PARAMETER;
++  *Event = NULL;
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   struct vhsakmt_ccmd_event_rsp* rsp;
+   vhsakmt_bo_handle event_bo;
+   vHsaEvent* e;
+-  int r;
++  int r = vhsakmt_require_wire_pointers(dev);
++  if (r) return r;
+   struct vhsakmt_ccmd_event_req req = {
+       .hdr = VHSAKMT_CCMD(EVENT, sizeof(struct vhsakmt_ccmd_event_req)),
+-      .type = VHSAKMT_CCMD_EVENT_CREATE,
+-      .create_args.EventDesc = *EventDesc,
++      .type = VHSAKMT_CCMD_EVENT_CREATE_V2,
++      .create_args.EventDesc.EventType = EventDesc->EventType,
++      .create_args.EventDesc.NodeId = EventDesc->NodeId,
+       .create_args.ManualReset = ManualReset,
+       .create_args.IsSignaled = IsSignaled,
+       .blob_id = vhsakmt_atomic_inc_return(&dev->next_blob_id),
+@@ -69,13 +73,18 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateEvent(HsaEventDescriptor* EventDesc, _Bool
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_event_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  if (rsp->ret) return rsp->ret;
++  r = vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
++  if (r) return r;
+ 
+   e = calloc(1, sizeof(vHsaEvent));
+   if (!e) return -ENOMEM;
+ 
+-  memcpy(e, &rsp->vevent, sizeof(vHsaEvent));
++  e->event.EventId = rsp->vevent.event.EventId;
++  e->event.EventData.EventType = rsp->vevent.event.EventData.EventType;
++  e->event.EventData.HWData1 = rsp->vevent.event.EventData.HWData1;
++  e->event.EventData.HWData2 = rsp->vevent.event.EventData.HWData2;
++  e->event.EventData.HWData3 = rsp->vevent.event.EventData.HWData3;
++  e->event.EventData.EventData.SyncVar = EventDesc->SyncVar;
+ 
+   r = vhsakmt_create_event_blob_bo(dev, sizeof(vHsaEvent), req.blob_id, e, &event_bo);
+   if (r) {
+@@ -91,7 +100,7 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateEvent(HsaEventDescriptor* EventDesc, _Bool
+       e->event.EventData.HWData3, e->event.EventData.EventType, e->event.EventId, e->event_handle,
+       event_bo->real.res_id);
+ 
+-  return rsp->ret;
++  return HSAKMT_STATUS_SUCCESS;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtDestroyEvent(HsaEvent* Event) {
+@@ -110,62 +119,56 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtDestroyEvent(HsaEvent* Event) {
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtSetEvent(HsaEvent* Event) {
+   CHECK_VIRTIO_KFD_OPEN();
++  if (!Event) return HSAKMT_STATUS_INVALID_PARAMETER;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   struct vhsakmt_ccmd_event_rsp* rsp;
+   struct vhsakmt_ccmd_event_req req = {
+       .hdr = VHSAKMT_CCMD(EVENT, sizeof(struct vhsakmt_ccmd_event_req)),
+       .type = VHSAKMT_CCMD_EVENT_SET,
+-      .event_hanele = vhsakmt_event_host_handle(Event),
+       .res_id = vhsakmt_event_res_id(Event),
+   };
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_event_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-
+-  return rsp->ret;
++  return vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtResetEvent(HsaEvent* Event) {
+   CHECK_VIRTIO_KFD_OPEN();
++  if (!Event) return HSAKMT_STATUS_INVALID_PARAMETER;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   struct vhsakmt_ccmd_event_rsp* rsp;
+   struct vhsakmt_ccmd_event_req req = {
+       .hdr = VHSAKMT_CCMD(EVENT, sizeof(struct vhsakmt_ccmd_event_req)),
+       .type = VHSAKMT_CCMD_EVENT_RESET,
+-      .event_hanele = vhsakmt_event_host_handle(Event),
+       .res_id = vhsakmt_event_res_id(Event),
+   };
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_event_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-
+-  return rsp->ret;
++  return vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtQueryEventState(HsaEvent* Event) {
+   CHECK_VIRTIO_KFD_OPEN();
++  if (!Event) return HSAKMT_STATUS_INVALID_PARAMETER;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   struct vhsakmt_ccmd_event_rsp* rsp;
+   struct vhsakmt_ccmd_event_req req = {
+       .hdr = VHSAKMT_CCMD(EVENT, sizeof(struct vhsakmt_ccmd_event_req)),
+       .type = VHSAKMT_CCMD_EVENT_QUERY_STATE,
+-      .event_hanele = vhsakmt_event_host_handle(Event),
+       .res_id = vhsakmt_event_res_id(Event),
+   };
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_event_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-
+-  return rsp->ret;
++  return vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtWaitOnMultipleEvents(HsaEvent* Events[], HSAuint32 NumEvents,
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_memory.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_memory.c
+index 83d7cf40a9..cf7853c022 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_memory.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_memory.c
+@@ -22,11 +22,21 @@
+ 
+ #include "hsakmt/hsakmt_virtio.h"
+ #include "hsakmt_virtio_device.h"
++#include <limits.h>
+ #include <unistd.h>
+ #include <xf86drm.h>
+ 
+ #define VHSA_GL_METADATA_MAX_SIZE (0x50)
+ 
++/* Parameters for the SVM/userptr blob registration path. */
++struct vhsakmt_svm_map_params {
++  void* addr;
++  size_t size;
++  bool use_svm;
++  bool read_only;
++  HsaMemFlags mem_flags;
++};
++
+ vhsakmt_bo_handle vhsakmt_entry_to_bo_handle(bo_entry e) { return (vhsakmt_bo_handle)e; }
+ bo_entry vhsakmt_bo_handle_to_entry(vhsakmt_bo_handle bo) { return &bo->rbtn; }
+ static inline bool vhsakmt_is_mem_bo(vhsakmt_bo_handle bo) { return (!bo->queue_id && !bo->event); }
+@@ -102,6 +112,18 @@ static void vhsakmt_insert_userptr(vhsakmt_device_handle dev, vhsakmt_bo_handle
+ 
+   pthread_mutex_lock(&dev->bo_handles_mutex);
+   hsakmt_interval_tree_insert(&dev->userptr_tree, &userptr->itn);
++  userptr->in_itree = true;
++  pthread_mutex_unlock(&dev->bo_handles_mutex);
++}
++
++/* Freeing a BO that is still linked here leaves a dangling node and the next
++ * tree walk spins forever. */
++static void vhsakmt_unlink_userptr(vhsakmt_device_handle dev, vhsakmt_bo_handle bo) {
++  pthread_mutex_lock(&dev->bo_handles_mutex);
++  if (bo->in_itree) {
++    hsakmt_interval_tree_remove(&dev->userptr_tree, &bo->itn);
++    bo->in_itree = false;
++  }
+   pthread_mutex_unlock(&dev->bo_handles_mutex);
+ }
+ 
+@@ -129,6 +151,9 @@ static vhsakmt_bo_handle vhsakmt_find_userptr(vhsakmt_device_handle dev, unsigne
+ }
+ 
+ static void vhsakmt_destroy_userptr(vhsakmt_device_handle dev, vhsakmt_bo_handle bo) {
++  if (__atomic_load_n(&dev->vgdev->transport_error, __ATOMIC_ACQUIRE)) return;
++  vhsakmt_unlink_userptr(dev, bo);
++  vhsakmt_remove_bo(dev, bo);
+   pthread_mutex_destroy(&bo->map_mutex);
+   pthread_mutex_destroy(&bo->amdgpu_bo.lock);
+ 
+@@ -144,9 +169,13 @@ void* vhsakmt_gpu_va(vhsakmt_device_handle dev, void* va) {
+ 
+   bo_entry entry = vhsakmt_find_entry_by_addr(dev, va);
+ 
+-  if (!entry) return NULL;
++  if (entry) return vhsakmt_entry_to_bo_handle(entry)->host_addr;
++
++  /* Registered userptrs live in the interval tree, not the rbtree. */
++  vhsakmt_bo_handle bo = vhsakmt_find_userptr(dev, (unsigned long)va, (unsigned long)va);
++  if (bo) return (char*)bo->host_addr + ((char*)va - (char*)bo->cpu_addr);
+ 
+-  return vhsakmt_entry_to_bo_handle(entry)->host_addr;
++  return NULL;
+ }
+ 
+ int vhsakmt_bo_cpu_map(vhsakmt_bo_handle bo, void** cpu, void* fixed_cpu) {
+@@ -169,7 +198,8 @@ int vhsakmt_bo_cpu_map(vhsakmt_bo_handle bo, void** cpu, void* fixed_cpu) {
+ }
+ 
+ int vhsakmt_bo_cpu_unmap(vhsakmt_bo_handle bo) {
+-  int r = 0;
++  int r = __atomic_load_n(&bo->dev->vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (r) return r;
+ 
+   pthread_mutex_lock(&bo->map_mutex);
+ 
+@@ -235,15 +265,19 @@ int vhsakmt_init_host_blob(vhsakmt_device_handle dev, size_t size, uint32_t blob
+   return 0;
+ }
+ 
+-static int vhsakmt_init_userptr_blob(vhsakmt_device_handle dev, void* addr, size_t size,
++static int vhsakmt_init_userptr_blob(vhsakmt_device_handle dev,
++                                     const struct vhsakmt_svm_map_params* p,
++                                     void* addr, size_t size,
+                                      vhsakmt_bo_handle* bo_handle, uint64_t* offset) {
+   int r;
++  if (p->read_only && !dev->vgdev->blob_readonly)
++    return -EOPNOTSUPP;
++
+   struct drm_virtgpu_resource_create_blob args = {
+-      .blob_mem = VIRTGPU_BLOB_MEM_HOST3D_GUEST,
+-      .blob_flags = VIRTGPU_BLOB_FLAG_USE_USERPTR,
++      .blob_mem = VIRTGPU_BLOB_MEM_GUEST,
++      .blob_flags = p->read_only ? VIRTGPU_BLOB_FLAG_USE_READONLY : 0,
+       .size = size,
+-      .blob_id = vhsakmt_atomic_inc_return(&dev->next_blob_id),
+-      .blob_userptr = (uint64_t)addr,
++      .userptr = (uint64_t)addr,
+   };
+ 
+   r = virtio_gpu_create_blob(dev->vgdev, &args);
+@@ -260,6 +294,7 @@ static int vhsakmt_init_userptr_blob(vhsakmt_device_handle dev, void* addr, size
+   userptr->real.alloc_size = size;
+   userptr->bo_type = VHSA_BO_USERPTR;
+   userptr->cpu_addr = addr;
++  userptr->flags = p->mem_flags;
+   pthread_mutex_init(&userptr->map_mutex, NULL);
+   pthread_mutex_init(&userptr->amdgpu_bo.lock, NULL);
+   atomic_store(&userptr->real.map_count, 0);
+@@ -269,7 +304,7 @@ static int vhsakmt_init_userptr_blob(vhsakmt_device_handle dev, void* addr, size
+   virtio_gpu_res_id(dev->vgdev, userptr->real.handle, &userptr->real.res_id);
+ 
+   *bo_handle = userptr;
+-  *offset = args.offset;
++  *offset = 0;
+   return r;
+ }
+ 
+@@ -326,7 +361,8 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtAllocMemoryAlign(HSAuint32 PreferredNode, HSAuint
+   if (!rsp->memory_handle) return -ENOMEM;
+ 
+   r = vhsakmt_init_host_blob(dev, SizeInBytes, VIRTGPU_BLOB_MEM_HOST3D,
+-                             vhsakmt_mappable(MemFlags) ? VIRTGPU_BLOB_FLAG_USE_MAPPABLE : 0,
++                             (vhsakmt_mappable(MemFlags) || MemFlags.ui32.NoAddress)
++                                 ? VIRTGPU_BLOB_FLAG_USE_MAPPABLE : 0,
+                              req.blob_id, VHSA_BO_KFD_MEM, (void*)rsp->memory_handle, &bo);
+   if (r) return r;
+   bo->flags = MemFlags;
+@@ -360,10 +396,49 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtAllocMemory(HSAuint32 PreferredNode, HSAuint64 Si
+   return vhsaKmtAllocMemoryAlign(PreferredNode, SizeInBytes, 0, MemFlags, MemoryAddress);
+ }
+ 
++/* VMM (hsa_amd_vmem_*) support over virtio-gpu.
++ *
++ * A physical memory handle (HsaMemFlags.NoAddress) is created as a mappable host
++ * blob (USE_MAPPABLE) but is not CPU-mapped at allocation time because it has no
++ * VA yet. When ROCr later maps the handle into a reserved VA (via the virtio
++ * driver Map()), vhsaKmtVirtioMapHandleToVA() blob-maps the owning allocation at
++ * that VA (MAP_FIXED) so CPU accesses to the VMM-mapped range resolve, mirroring
++ * the GPU-side amdgpu VA mapping. MemoryHandle is the physical vhsakmt_bo (the
++ * value stored in core::DriverMemoryHandle::handle). */
++HSAKMT_STATUS HSAKMTAPI vhsaKmtVirtioMapHandleToVA(void* MemoryHandle, void* Va, HSAuint64 Size) {
++  CHECK_VIRTIO_KFD_OPEN();
++
++  vhsakmt_bo_handle bo = (vhsakmt_bo_handle)MemoryHandle;
++  if (!bo) return HSAKMT_STATUS_INVALID_HANDLE;
++
++  void* cpu = Va;
++  int r = virtio_gpu_map_handle(bo->dev->vgdev, bo->real.handle, Size, &cpu, Va);
++  if (r || cpu != Va) {
++    vhsa_err("%s: blob map failed va=%p size=%lx handle=%u r=%d cpu=%p\n", __FUNCTION__, Va, Size,
++             bo->real.handle, r, cpu);
++    return HSAKMT_STATUS_ERROR;
++  }
++
++  vhsa_debug("%s: mapped blob handle=%u at va=%p size=%lx\n", __FUNCTION__, bo->real.handle, Va,
++             Size);
++  return HSAKMT_STATUS_SUCCESS;
++}
++
++HSAKMT_STATUS HSAKMTAPI vhsaKmtVirtioUnmapHandleFromVA(void* Va, HSAuint64 Size) {
++  CHECK_VIRTIO_KFD_OPEN();
++
++  if (__atomic_load_n(&vhsakmt_dev()->vgdev->transport_error, __ATOMIC_ACQUIRE))
++    return HSAKMT_STATUS_ERROR;
++  virtio_gpu_unmap(Va, Size);
++  return HSAKMT_STATUS_SUCCESS;
++}
++
+ int vhsakmt_bo_free(vhsakmt_device_handle dev, vhsakmt_bo_handle bo) {
+   bo_entry entry;
+   int r;
+ 
++  r = __atomic_load_n(&dev->vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (r) return r;
+   if (vhsakmt_atomic_dec_return(&bo->refcount) > 0) return 0;
+ 
+   entry = vhsakmt_bo_handle_to_entry(bo);
+@@ -391,12 +466,22 @@ int vhsakmt_bo_free(vhsakmt_device_handle dev, vhsakmt_bo_handle bo) {
+   return r;
+ }
+ 
+-/* Only remove bo in rbtree */
+ static void vhsakmt_remove_userptr_bo(vhsakmt_device_handle dev, vhsakmt_bo_handle bo) {
++  if (__atomic_load_n(&dev->vgdev->transport_error, __ATOMIC_ACQUIRE)) return;
++  vhsakmt_unlink_userptr(dev, bo);
+   vhsakmt_remove_bo(dev, bo);
+   free(bo);
+ }
+ 
++static void vhsakmt_discard_userptr(vhsakmt_device_handle dev, vhsakmt_bo_handle bo) {
++  if (__atomic_load_n(&dev->vgdev->transport_error, __ATOMIC_ACQUIRE)) return;
++  vhsakmt_unlink_userptr(dev, bo);
++  virtio_gpu_destroy_handle(dev->vgdev, bo->real.handle);
++  pthread_mutex_destroy(&bo->map_mutex);
++  pthread_mutex_destroy(&bo->amdgpu_bo.lock);
++  free(bo);
++}
++
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtFreeMemory(void* MemoryAddress, HSAuint64 SizeInBytes) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
+@@ -631,59 +716,50 @@ static int vhsakmt_map_userptr(vhsakmt_device_handle dev, void* addr, size_t siz
+   return rsp->ret;
+ }
+ 
+-static vhsakmt_bo_handle vhsakmt_map_to_gpu(void* addr, size_t size, bool use_svm) {
++static vhsakmt_bo_handle vhsakmt_map_to_gpu(const struct vhsakmt_svm_map_params* p) {
+   vhsakmt_device_handle dev = vhsakmt_dev();
++  void* addr = p->addr;
++  size_t size = p->size;
+   size_t page_size = getpagesize();
+   size_t addr_offset = (uint64_t)addr % page_size;
+   void* blob_addr;
+   size_t blob_size;
+   uint64_t userptr_offset = 0, userptr_handle = 0;
+   vhsakmt_bo_handle userptr;
++  int r_init;
+   int r;
+ 
+-  if (use_svm) {
+-    blob_addr = addr;
+-    blob_size = size;
+-  } else {
+-    blob_addr = (void*)((uint64_t)addr - addr_offset);
+-    blob_size = VHSA_ALIGN_UP(size + addr_offset, page_size);
+-  }
++  /* The kernel rejects a userptr whose base or size is not page aligned. */
++  blob_addr = (void*)((uint64_t)addr - addr_offset);
++  blob_size = VHSA_ALIGN_UP(size + addr_offset, page_size);
+ 
+-  vhsa_debug("%s: addr: %p, size: 0x%lx, offset: 0x%lx, blob_addr: %p, blob_size: 0x%lx, svm: %d\n",
+-             __FUNCTION__, addr, size, addr_offset, blob_addr, blob_size, use_svm);
++  vhsa_debug("%s: addr: %p, size: 0x%lx, offset: 0x%lx, blob_addr: %p, blob_size: 0x%lx\n",
++             __FUNCTION__, addr, size, addr_offset, blob_addr, blob_size);
+ 
+-  r = vhsakmt_init_userptr_blob(dev, blob_addr, blob_size, &userptr, &userptr_offset);
+-  if (r < 0) {
+-    vhsa_debug("%s: userptr create failed at address: %p, ret = %d\n", __FUNCTION__, addr, r);
++  r_init = vhsakmt_init_userptr_blob(dev, p, blob_addr, blob_size, &userptr, &userptr_offset);
++  if (r_init < 0) {
++    vhsa_debug("%s: userptr create failed at address: %p, ret = %d\n", __FUNCTION__, addr, r_init);
+     return NULL;
+   }
+ 
+   r = vhsakmt_map_userptr(dev, addr, size, userptr->real.res_id, &userptr_handle);
+-  if (!userptr_handle) {
++  if (r || !userptr_handle) {
+     vhsa_debug("%s: map userptr failed at address: %p, ret = %d\n", __FUNCTION__, addr, r);
+-    vhsakmt_destroy_handle(dev, userptr);
+-    vhsakmt_remove_userptr_bo(dev, userptr);
++    vhsakmt_discard_userptr(dev, userptr);
+     return NULL;
+   }
+ 
+-  if (use_svm) {
+-    userptr->host_addr = VHSA_UINT64_TO_VPTR(VHSA_VPTR_TO_UINT64(userptr_handle) + addr_offset);
+-  } else {
+-    userptr->host_addr = VHSA_UINT64_TO_VPTR(userptr_handle);
+-  }
++  userptr->host_addr =
++      VHSA_UINT64_TO_VPTR(VHSA_VPTR_TO_UINT64(userptr_handle) + addr_offset);
+ 
+-  if (r > 0) {
++  if (r_init > 0) {
+     vhsa_debug("%s: userptr: %p already registered, offset: %lx\n", __FUNCTION__, addr,
+                userptr_offset);
+     userptr->host_addr =
+         VHSA_UINT64_TO_VPTR(VHSA_VPTR_TO_UINT64(userptr->host_addr) + userptr_offset);
+   }
+ 
+-  if (use_svm) {
+-    vhsakmt_insert_bo(dev, userptr, userptr->cpu_addr, userptr->size);
+-  } else {
+-    vhsakmt_insert_userptr(dev, userptr);
+-  }
++  vhsakmt_insert_userptr(dev, userptr);
+ 
+   vhsa_debug("%s: gva: %p, cpu_addr: %p, hva: %p, size: %lx, offset: %lx, blob_size: 0x%lx\n",
+              __FUNCTION__, addr, userptr->cpu_addr, userptr->host_addr, size, addr_offset,
+@@ -712,10 +788,21 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterMemoryWithFlags(void* MemoryAddress,
+   /* no need to register memory from lihsakmt / not a userptr */
+   if (!vhsakmt_is_userptr(dev, MemoryAddress)) return HSAKMT_STATUS_SUCCESS;
+ 
+-  if (!dev->use_svm) {
++  /* Reject before the ioctl: the kernel would otherwise pin every page and
++   * round-trip to the host before anything could decline. */
++  if (!dev->userptr_enabled) return HSAKMT_STATUS_ERROR;
++  int ret = vhsakmt_require_wire_features(dev, VHSAKMT_WIRE_FEATURE_USERPTR_LIFETIME);
++  if (ret)
++    return ret == -EOPNOTSUPP ? HSAKMT_STATUS_NOT_SUPPORTED : HSAKMT_STATUS_ERROR;
++  if (MemFlags.ui32.ReadOnly && !dev->vgdev->blob_readonly)
++    return HSAKMT_STATUS_NOT_SUPPORTED;
++
++  {
+     vhsakmt_bo_handle bo = vhsakmt_find_userptr(dev, (uint64_t)MemoryAddress,
+                                                 (uint64_t)MemoryAddress + MemorySizeInBytes - 1UL);
+     if (bo) {
++      if (bo->flags.ui32.ReadOnly != MemFlags.ui32.ReadOnly)
++        return HSAKMT_STATUS_MEMORY_ALREADY_REGISTERED;
+       vhsa_debug(
+           "%s: memory already registered, MemoryAddress:%p, bo address: %p, size: %x, "
+           "res_id: %d, count: %d\n",
+@@ -725,7 +812,14 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterMemoryWithFlags(void* MemoryAddress,
+     }
+   }
+ 
+-  userptr = vhsakmt_map_to_gpu(MemoryAddress, MemorySizeInBytes, dev->use_svm);
++  struct vhsakmt_svm_map_params map_params = {
++      .addr = MemoryAddress,
++      .size = MemorySizeInBytes,
++      .use_svm = dev->use_svm,
++      .read_only = MemFlags.ui32.ReadOnly,
++      .mem_flags = MemFlags,
++  };
++  userptr = vhsakmt_map_to_gpu(&map_params);
+ 
+   if (!userptr) {
+     vhsa_debug(
+@@ -738,10 +832,16 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterMemoryWithFlags(void* MemoryAddress,
+   req.res_id = userptr->real.res_id;
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
+-  if (!rsp) return -ENOMEM;
++  if (!rsp) {
++    vhsakmt_discard_userptr(dev, userptr);
++    return HSAKMT_STATUS_NO_MEMORY;
++  }
+ 
+   vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  return rsp->ret;
++  HSAKMT_STATUS status = rsp->ret;
++  if (status != HSAKMT_STATUS_SUCCESS)
++    vhsakmt_discard_userptr(dev, userptr);
++  return status;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterMemory(void* MemoryAddress, HSAuint64 MemorySizeInBytes) {
+@@ -776,85 +876,53 @@ static int vhsakmt_remove_clgl_bo(vhsakmt_device_handle dev, vhsakmt_bo_handle b
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  if (rsp->ret) vhsa_err("%s: deregister failed clgl memory gva: %p\n", __FUNCTION__, bo->cpu_addr);
+-
+-  vhsakmt_bo_free(dev, bo);
++  int ret = vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  if (!ret) ret = rsp->ret;
++  if (ret) {
++    vhsa_err("%s: deregister failed clgl memory gva: %p\n", __FUNCTION__, bo->cpu_addr);
++    return ret;
++  }
+ 
+-  vhsa_debug("%s: deregister clgl memory gva: %p, ret: %d\n", __FUNCTION__, bo->cpu_addr, rsp->ret);
+-  return rsp->ret;
++  vhsa_debug("%s: deregister clgl memory gva: %p\n", __FUNCTION__, bo->cpu_addr);
++  return vhsakmt_bo_free(dev, bo);
+ }
+ 
+-static int vhsakmt_deregister_userptr_non_svm(vhsakmt_device_handle dev, void* MemoryAddress) {
++static int vhsakmt_deregister_userptr(vhsakmt_device_handle dev, void* MemoryAddress) {
++  int ret = __atomic_load_n(&dev->vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (ret) return ret;
+   size_t page_size = getpagesize();
+   unsigned long aligned_addr = ((uint64_t)MemoryAddress / page_size) * page_size;
++  vhsakmt_bo_handle to_free = NULL;
+   interval_tree_node_t* n;
+-  vhsakmt_bo_handle* bos_to_free = NULL;
+-  int free_count = 0;
+-  int free_capacity = 0;
+ 
+   pthread_mutex_lock(&dev->bo_handles_mutex);
+ 
+-  /* First pass: Decrement refcounts and check if all can be freed */
+-  bool can_free_all = true;
++  /* Registration bumps the refcount of the bo CONTAINING the range, so match
++   * the same bo here rather than requiring an exact base address. */
+   n = hsakmt_interval_tree_iter_first(&dev->userptr_tree, aligned_addr, aligned_addr);
+   while (n) {
+     vhsakmt_bo_handle bo = (vhsakmt_bo_handle)((char*)n - offsetof(struct vhsakmt_bo, itn));
+-    if (bo->cpu_addr == (void*)aligned_addr) {
++    if ((unsigned long)bo->cpu_addr <= aligned_addr &&
++        (unsigned long)bo->cpu_addr + bo->size - 1UL >= aligned_addr) {
+       vhsa_debug("%s: found userptr: %p, size: %x, res_id: %d, count: %d\n", __FUNCTION__,
+                  bo->cpu_addr, bo->size, bo->real.res_id, bo->refcount);
+ 
+-      if (vhsakmt_atomic_dec_return(&bo->refcount) > 0) {
+-        can_free_all = false;
+-      }
+-    }
+-    n = hsakmt_interval_tree_iter_next(&dev->userptr_tree, n, aligned_addr, aligned_addr);
+-  }
+-
+-  /* Second pass: Collect BOs to free and remove from tree */
+-  if (can_free_all) {
+-    n = hsakmt_interval_tree_iter_first(&dev->userptr_tree, aligned_addr, aligned_addr);
+-    while (n) {
+-      vhsakmt_bo_handle bo = (vhsakmt_bo_handle)((char*)n - offsetof(struct vhsakmt_bo, itn));
+-      interval_tree_node_t* next =
+-          hsakmt_interval_tree_iter_next(&dev->userptr_tree, n, aligned_addr, aligned_addr);
+-
+-      if (bo->cpu_addr == (void*)aligned_addr) {
+-        vhsa_debug("%s: destroying userptr: %p, size: %x, res_id: %d\n", __FUNCTION__, bo->cpu_addr,
+-                   bo->size, bo->real.res_id);
++      if (vhsakmt_atomic_dec_return(&bo->refcount) <= 0) {
++        vhsa_debug("%s: destroying userptr: %p, size: %x, res_id: %d\n", __FUNCTION__,
++                   bo->cpu_addr, bo->size, bo->real.res_id);
+ 
+         hsakmt_interval_tree_remove(&dev->userptr_tree, &bo->itn);
+-
+-        if (free_count >= free_capacity) {
+-          int new_capacity = free_capacity == 0 ? 32 : free_capacity * 2;
+-          vhsakmt_bo_handle* new_array = realloc(bos_to_free, new_capacity * sizeof(vhsakmt_bo_handle));
+-          if (!new_array) {
+-            vhsa_err("%s: failed to allocate memory for BO array, freeing %d BOs\n", __FUNCTION__, free_count);
+-            pthread_mutex_unlock(&dev->bo_handles_mutex);
+-            goto cleanup;
+-          }
+-          bos_to_free = new_array;
+-          free_capacity = new_capacity;
+-        }
+-
+-        bos_to_free[free_count++] = bo;
++        bo->in_itree = false;
++        to_free = bo;
+       }
+-
+-      n = next;
++      break;
+     }
++    n = hsakmt_interval_tree_iter_next(&dev->userptr_tree, n, aligned_addr, aligned_addr);
+   }
+ 
+   pthread_mutex_unlock(&dev->bo_handles_mutex);
+ 
+-cleanup:
+-  for (int i = 0; i < free_count; i++) {
+-    vhsakmt_bo_handle bo = bos_to_free[i];
+-    vhsakmt_destroy_userptr(dev, bo);
+-  }
+-
+-  if (bos_to_free) {
+-    free(bos_to_free);
+-  }
++  if (to_free) vhsakmt_destroy_userptr(dev, to_free);
+ 
+   return 0;
+ }
+@@ -867,53 +935,113 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtDeregisterMemory(void* MemoryAddress) {
+ 
+   if (bo && (bo->bo_type & VHSA_BO_AMDGPU)) return vhsakmt_remove_clgl_bo(dev, bo);
+ 
+-  if (!dev->use_svm) {
+-    return vhsakmt_deregister_userptr_non_svm(dev, MemoryAddress);
++  return vhsakmt_deregister_userptr(dev, MemoryAddress);
++}
++
++static vhsakmt_bo_handle vhsakmt_pointer_info_bo_locked(vhsakmt_device_handle dev,
++                                                      uintptr_t address, uint64_t* offset) {
++  rbtree_key_t key = rbtree_key(address, 0);
++  bo_entry entry = rbtree_lookup_nearest(&dev->bo_rbt, &key, LKP_ADDR, LEFT);
++  vhsakmt_bo_handle bo = entry ? vhsakmt_entry_to_bo_handle(entry) : NULL;
++  if (bo && vhsakmt_is_mem_bo(bo) && address >= entry->key.addr &&
++      address - entry->key.addr < bo->size) {
++    *offset = address - entry->key.addr;
++    return bo;
+   }
+ 
+-  return 0;
++  for (entry = rbtree_min_max(&dev->bo_rbt, LEFT); entry;
++       entry = hsakmt_rbtree_next(&dev->bo_rbt, entry)) {
++    bo = vhsakmt_entry_to_bo_handle(entry);
++    if (vhsakmt_is_mem_bo(bo) && bo->host_addr && address >= (uintptr_t)bo->host_addr &&
++        address - (uintptr_t)bo->host_addr < bo->size) {
++      *offset = address - (uintptr_t)bo->host_addr;
++      return bo;
++    }
++  }
++
++  interval_tree_node_t* node = hsakmt_interval_tree_iter_first(&dev->userptr_tree, 0, ULONG_MAX);
++  while (node) {
++    bo = (vhsakmt_bo_handle)((char*)node - offsetof(struct vhsakmt_bo, itn));
++    uintptr_t base = (uintptr_t)bo->cpu_addr;
++    if (address < base || address - base >= bo->size) base = (uintptr_t)bo->host_addr;
++    if (base && address >= base && address - base < bo->size) {
++      *offset = address - base;
++      return bo;
++    }
++    node = hsakmt_interval_tree_iter_next(&dev->userptr_tree, node, 0, ULONG_MAX);
++  }
++  return NULL;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtQueryPointerInfo(const void* Pointer, HsaPointerInfo* PointerInfo) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
++  if (!PointerInfo) return HSAKMT_STATUS_INVALID_PARAMETER;
++  memset(PointerInfo, 0, sizeof(*PointerInfo));
++  if (!Pointer) return HSAKMT_STATUS_INVALID_PARAMETER;
+   vhsakmt_device_handle dev = vhsakmt_dev();
+-  void* gpu_va = vhsakmt_gpu_va(dev, VHSA_UINT64_TO_VPTR(Pointer));
+-  if (!gpu_va) return -HSAKMT_STATUS_ERROR;
++  int ret = vhsakmt_require_wire_pointers(dev);
++  if (ret) return ret;
++  uint64_t offset = 0;
++  pthread_mutex_lock(&dev->bo_handles_mutex);
++  vhsakmt_bo_handle bo = vhsakmt_pointer_info_bo_locked(dev, (uintptr_t)Pointer, &offset);
++  if (!bo || !bo->host_addr || offset > UINT64_MAX - (uintptr_t)bo->host_addr) {
++    pthread_mutex_unlock(&dev->bo_handles_mutex);
++    return HSAKMT_STATUS_INVALID_HANDLE;
++  }
++  uint64_t address = (uintptr_t)bo->host_addr + offset;
++  uint32_t res_id = bo->real.res_id;
++  pthread_mutex_unlock(&dev->bo_handles_mutex);
+   struct vhsakmt_ccmd_query_info_rsp* rsp;
+   struct vhsakmt_ccmd_query_info_req req = {
+       .hdr = VHSAKMT_CCMD(QUERY_INFO, sizeof(struct vhsakmt_ccmd_query_info_req)),
+-      .type = VHSAKMT_CCMD_QUERY_POINTER_INFO,
+-      .pointer = VHSA_VPTR_TO_UINT64(gpu_va),
++      .type = VHSAKMT_CCMD_QUERY_POINTER_INFO_V2,
++      .pointer_info_args = {
++          .address = address,
++          .res_id = res_id,
++      },
+   };
+ 
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr,
+                           sizeof(struct vhsakmt_ccmd_query_info_rsp) +
+-                              QUERY_PTR_INFO_MAX_MAPPED_NODES * sizeof(uint32_t));
++                              2 * VHSAKMT_MEMORY_MAX_NODES * sizeof(uint32_t));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-
+-  memcpy(PointerInfo, &rsp->ptr_info, sizeof(HsaPointerInfo));
+-
+-  if (PointerInfo->NMappedNodes && PointerInfo->MappedNodes) {
+-    if (PointerInfo->NMappedNodes > QUERY_PTR_INFO_MAX_MAPPED_NODES) {
+-      PointerInfo->NMappedNodes = QUERY_PTR_INFO_MAX_MAPPED_NODES;
+-      vhsa_debug(
+-          "%s: query pointer: %p info mapped nodes greater than QUERY_PTR_INFO_MAX_MAPPED_NODES\n",
+-          __FUNCTION__, Pointer);
+-    }
++  rsp->ret = -EOPNOTSUPP;
++  ret = vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  if (ret) return ret;
++  if (rsp->ret) return rsp->ret;
++  if (rsp->hdr.len < sizeof(*rsp)) return -EIO;
++  HsaPointerInfo info = rsp->ptr_info;
++  if (info.NRegisteredNodes > VHSAKMT_MEMORY_MAX_NODES ||
++      info.NMappedNodes > VHSAKMT_MEMORY_MAX_NODES)
++    return -EOVERFLOW;
++  uint32_t count = info.NRegisteredNodes + info.NMappedNodes;
++  if (rsp->hdr.len < sizeof(*rsp) + count * sizeof(uint32_t)) return -EIO;
+ 
+-    PointerInfo->MappedNodes = calloc(PointerInfo->NMappedNodes, sizeof(uint32_t));
+-    if (!PointerInfo->MappedNodes) {
+-      PointerInfo->NMappedNodes = 0;
+-      return -HSAKMT_STATUS_NO_MEMORY;
+-    }
+-    memcpy(VHSA_UINT64_TO_VPTR(PointerInfo->MappedNodes), rsp->payload,
+-           PointerInfo->NMappedNodes * sizeof(uint32_t));
++  pthread_mutex_lock(&dev->bo_handles_mutex);
++  bo = vhsakmt_pointer_info_bo_locked(dev, (uintptr_t)Pointer, &offset);
++  if (!bo || bo->real.res_id != res_id || !bo->host_addr ||
++      offset > UINT64_MAX - (uintptr_t)bo->host_addr ||
++      (uintptr_t)bo->host_addr + offset != address) {
++    pthread_mutex_unlock(&dev->bo_handles_mutex);
++    return HSAKMT_STATUS_INVALID_HANDLE;
+   }
+-
+-  return rsp->ret;
++  if (info.NRegisteredNodes)
++    memcpy(bo->registered_nodes, rsp->payload, info.NRegisteredNodes * sizeof(uint32_t));
++  if (info.NMappedNodes)
++    memcpy(bo->mapped_nodes, rsp->payload + info.NRegisteredNodes * sizeof(uint32_t),
++           info.NMappedNodes * sizeof(uint32_t));
++  info.RegisteredNodes = info.NRegisteredNodes ? bo->registered_nodes : NULL;
++  info.MappedNodes = info.NMappedNodes ? bo->mapped_nodes : NULL;
++  info.CPUAddress = NULL;
++  if (info.Type == HSA_POINTER_ALLOCATED || info.Type == HSA_POINTER_REGISTERED_USER) {
++    info.CPUAddress = bo->cpu_addr;
++  }
++  info.UserData = bo->user_data;
++  *PointerInfo = info;
++  pthread_mutex_unlock(&dev->bo_handles_mutex);
++  return HSAKMT_STATUS_SUCCESS;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtGetTileConfig(HSAuint32 NodeId, HsaGpuTileConfig* config) {
+@@ -997,10 +1125,14 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterGraphicsHandleToNodesExt(
+     HSAuint64 NumberOfNodes, HSAuint32* NodeArray, HSA_REGISTER_MEM_FLAGS RegisterFlags) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
++  if (!GraphicsResourceInfo || NumberOfNodes > VHSAKMT_MEMORY_MAX_NODES ||
++      (NumberOfNodes && !NodeArray))
++    return HSAKMT_STATUS_INVALID_PARAMETER;
++
+   vhsakmt_device_handle dev = vhsakmt_dev();
+-  uint32_t bo_handle, res_id;
++  uint32_t bo_handle = 0, res_id = GraphicsResourceHandle;
+   uint64_t meta_data_size = VHSA_GL_METADATA_MAX_SIZE;
+-  unsigned req_len = sizeof(struct vhsakmt_ccmd_gl_inter_req) + NumberOfNodes * sizeof(NodeArray);
++  unsigned req_len = sizeof(struct vhsakmt_ccmd_gl_inter_req) + NumberOfNodes * sizeof(*NodeArray);
+   struct vhsakmt_ccmd_gl_inter_req* req;
+   struct vhsakmt_ccmd_gl_inter_rsp* rsp;
+   int r;
+@@ -1017,7 +1149,10 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterGraphicsHandleToNodesExt(
+   req->reg_ghd_to_nodes.GraphicsResourceHandle = GraphicsResourceHandle;
+ #else
+   r = vhsakmt_handle_to_resid(dev, GraphicsResourceHandle, &res_id, &bo_handle);
+-  if (r) return r;
++  if (r) {
++    free(req);
++    return r;
++  }
+ 
+   req->reg_ghd_to_nodes.GraphicsResourceHandle = bo_handle;
+   req->reg_ghd_to_nodes.res_handle = res_id;
+@@ -1025,7 +1160,8 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterGraphicsHandleToNodesExt(
+ 
+   req->reg_ghd_to_nodes.flag = RegisterFlags.Value;
+ 
+-  memcpy(req->payload, NodeArray, NumberOfNodes * sizeof(NodeArray));
++  if (NumberOfNodes)
++    memcpy(req->payload, NodeArray, NumberOfNodes * sizeof(*NodeArray));
+ 
+   rsp =
+       vhsakmt_alloc_rsp(dev, &req->hdr, sizeof(struct vhsakmt_ccmd_gl_inter_rsp) + meta_data_size);
+@@ -1034,8 +1170,17 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterGraphicsHandleToNodesExt(
+     goto free_out;
+   }
+ 
+-  vhsakmt_execbuf_cpu(dev, &req->hdr, __FUNCTION__);
+-  if (rsp->ret) return rsp->ret;
++  r = vhsakmt_execbuf_cpu(dev, &req->hdr, __FUNCTION__);
++  if (!r) r = rsp->ret;
++  if (r) {
++    free(req);
++    return r;
++  }
++  if (rsp->hdr.len < sizeof(*rsp) || rsp->info.MetadataSizeInBytes > meta_data_size ||
++      rsp->info.MetadataSizeInBytes > rsp->hdr.len - sizeof(*rsp)) {
++    r = -EPROTO;
++    goto free_out;
++  }
+ 
+   memcpy(GraphicsResourceInfo, &rsp->info, sizeof(HsaGraphicsResourceInfo));
+   if (rsp->info.MetadataSizeInBytes) {
+@@ -1178,14 +1323,20 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterSharedHandleToNodes(
+     const HsaSharedMemoryHandle* SharedMemoryHandle, void** MemoryAddress, HSAuint64* SizeInBytes,
+     HSAuint64 NumberOfNodes, HSAuint32* NodeArray) {
+   CHECK_VIRTIO_KFD_OPEN();
+-  if (NumberOfNodes > VHSAKMT_MEMORY_MAX_NODES) return -EINVAL;
++  if (!SharedMemoryHandle || !MemoryAddress || !SizeInBytes ||
++      NumberOfNodes > VHSAKMT_MEMORY_MAX_NODES || (NumberOfNodes && !NodeArray))
++    return -EINVAL;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   vhsakmt_bo_handle bo;
+   struct vhsakmt_ccmd_memory_rsp* rsp;
+-  struct vhsakmt_ccmd_memory_req req = {
++  _Alignas(struct vhsakmt_ccmd_memory_req)
++  uint8_t reqbuf[sizeof(struct vhsakmt_ccmd_memory_req) +
++                 VHSAKMT_MEMORY_MAX_NODES * sizeof(*NodeArray)] = {0};
++  struct vhsakmt_ccmd_memory_req* req = (struct vhsakmt_ccmd_memory_req*)reqbuf;
++  *req = (struct vhsakmt_ccmd_memory_req){
+       .hdr = VHSAKMT_CCMD(
+-          MEMORY, sizeof(struct vhsakmt_ccmd_memory_req) + NumberOfNodes * sizeof(NodeArray)),
++          MEMORY, sizeof(*req) + NumberOfNodes * sizeof(*NodeArray)),
+       .type = VHSAKMT_CCMD_MEMORY_REGISTER_SHARED_HANDLE,
+       .blob_id = vhsakmt_atomic_inc_return(&dev->next_blob_id),
+       .register_shared_handle_args = {
+@@ -1193,14 +1344,16 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterSharedHandleToNodes(
+       }};
+   int r;
+ 
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
++  rsp = vhsakmt_alloc_rsp(dev, &req->hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  memcpy(req.payload, NodeArray, NumberOfNodes * sizeof(NodeArray));
+-  memcpy(&req.register_shared_handle_args.SharedMemoryHandle, SharedMemoryHandle,
++  if (NumberOfNodes)
++    memcpy(req->payload, NodeArray, NumberOfNodes * sizeof(*NodeArray));
++  memcpy(&req->register_shared_handle_args.SharedMemoryHandle, SharedMemoryHandle,
+          sizeof(HsaSharedMemoryHandle));
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  r = vhsakmt_execbuf_cpu(dev, &req->hdr, __FUNCTION__);
++  if (r) return r;
+   if (rsp->ret) return rsp->ret;
+ 
+   if (!rsp->register_shared_handle_rsp.memory_handle || !rsp->register_shared_handle_rsp.size)
+@@ -1208,7 +1361,7 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtRegisterSharedHandleToNodes(
+ 
+   // treat as VHSA_BO_KFD_MEM for shared handle memory
+   r = vhsakmt_init_host_blob(dev, rsp->register_shared_handle_rsp.size, VIRTGPU_BLOB_MEM_HOST3D,
+-                             VIRTGPU_BLOB_FLAG_USE_MAPPABLE, req.blob_id, VHSA_BO_KFD_MEM,
++                             VIRTGPU_BLOB_FLAG_USE_MAPPABLE, req->blob_id, VHSA_BO_KFD_MEM,
+                              (void*)rsp->register_shared_handle_rsp.memory_handle, &bo);
+   if (r) return r;
+ 
+@@ -1272,14 +1425,18 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtSetMemoryUserData(const void* Pointer, void* User
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtSVMGetAttr(void* start_addr, HSAuint64 size, unsigned int nattr,
+                                           HSA_SVM_ATTRIBUTE* attrs) {
+   CHECK_VIRTIO_KFD_OPEN();
+-  if (nattr > VHSAKMT_MEMORY_MAX_NATTR) return -EINVAL;
++  if (nattr > VHSAKMT_MEMORY_MAX_NATTR || (nattr && !attrs)) return -EINVAL;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   struct vhsakmt_ccmd_memory_rsp* rsp;
+   vhsakmt_bo_handle bo;
+   size_t req_len = sizeof(struct vhsakmt_ccmd_memory_req) + nattr * sizeof(HSA_SVM_ATTRIBUTE);
+   size_t rsp_len = sizeof(struct vhsakmt_ccmd_memory_rsp) + nattr * sizeof(HSA_SVM_ATTRIBUTE);
+-  struct vhsakmt_ccmd_memory_req req = {
++  _Alignas(struct vhsakmt_ccmd_memory_req)
++  uint8_t reqbuf[sizeof(struct vhsakmt_ccmd_memory_req) +
++                 VHSAKMT_MEMORY_MAX_NATTR * sizeof(*attrs)] = {0};
++  struct vhsakmt_ccmd_memory_req* req = (struct vhsakmt_ccmd_memory_req*)reqbuf;
++  *req = (struct vhsakmt_ccmd_memory_req){
+       .hdr = VHSAKMT_CCMD(MEMORY, req_len),
+       .type = VHSAKMT_CCMD_MEMORY_SVM_GET_ATTR,
+       .svm_attr_args =
+@@ -1292,15 +1449,18 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtSVMGetAttr(void* start_addr, HSAuint64 size, unsi
+ 
+   bo = vhsakmt_find_bo_by_addr(dev, start_addr);
+   if (!bo) return HSAKMT_STATUS_INVALID_HANDLE;
+-  req.res_id = bo->real.res_id;
++  req->res_id = bo->real.res_id;
+ 
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, rsp_len);
++  if (nattr) memcpy(req->payload, attrs, nattr * sizeof(*attrs));
++  rsp = vhsakmt_alloc_rsp(dev, &req->hdr, rsp_len);
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  int ret = vhsakmt_execbuf_cpu(dev, &req->hdr, __FUNCTION__);
++  if (ret) return ret;
+   if (rsp->ret) return rsp->ret;
+ 
+-  memcpy(req.payload, attrs, nattr * sizeof(HSA_SVM_ATTRIBUTE));
++  if (rsp->hdr.len < rsp_len) return -EPROTO;
++  if (nattr) memcpy(attrs, rsp->payload, nattr * sizeof(*attrs));
+ 
+   return rsp->ret;
+ }
+@@ -1308,12 +1468,16 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtSVMGetAttr(void* start_addr, HSAuint64 size, unsi
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtSVMSetAttr(void* start_addr, HSAuint64 size, unsigned int nattr,
+                                           HSA_SVM_ATTRIBUTE* attrs) {
+   CHECK_VIRTIO_KFD_OPEN();
+-  if (nattr > VHSAKMT_MEMORY_MAX_NATTR) return -EINVAL;
++  if (nattr > VHSAKMT_MEMORY_MAX_NATTR || (nattr && !attrs)) return -EINVAL;
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   vhsakmt_bo_handle bo;
+   struct vhsakmt_ccmd_memory_rsp* rsp;
+   size_t req_len = sizeof(struct vhsakmt_ccmd_memory_req) + nattr * sizeof(HSA_SVM_ATTRIBUTE);
+-  struct vhsakmt_ccmd_memory_req req = {
++  _Alignas(struct vhsakmt_ccmd_memory_req)
++  uint8_t reqbuf[sizeof(struct vhsakmt_ccmd_memory_req) +
++                 VHSAKMT_MEMORY_MAX_NATTR * sizeof(*attrs)] = {0};
++  struct vhsakmt_ccmd_memory_req* req = (struct vhsakmt_ccmd_memory_req*)reqbuf;
++  *req = (struct vhsakmt_ccmd_memory_req){
+       .hdr = VHSAKMT_CCMD(MEMORY, req_len),
+       .type = VHSAKMT_CCMD_MEMORY_SVM_SET_ATTR,
+       .svm_attr_args =
+@@ -1326,14 +1490,15 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtSVMSetAttr(void* start_addr, HSAuint64 size, unsi
+ 
+   bo = vhsakmt_find_bo_by_addr(dev, start_addr);
+   if (!bo) return HSAKMT_STATUS_INVALID_HANDLE;
+-  req.res_id = bo->real.res_id;
++  req->res_id = bo->real.res_id;
+ 
+-  memcpy(req.payload, attrs, nattr * sizeof(HSA_SVM_ATTRIBUTE));
++  if (nattr) memcpy(req->payload, attrs, nattr * sizeof(*attrs));
+ 
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
++  rsp = vhsakmt_alloc_rsp(dev, &req->hdr, sizeof(struct vhsakmt_ccmd_memory_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
++  int ret = vhsakmt_execbuf_cpu(dev, &req->hdr, __FUNCTION__);
++  if (ret) return ret;
+   if (rsp->ret) return rsp->ret;
+ 
+   return rsp->ret;
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_openclose.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_openclose.c
+index 2f8810d320..6fdfab4b46 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_openclose.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_openclose.c
+@@ -22,10 +22,16 @@
+ 
+ #include "hsakmt/hsakmt_virtio.h"
+ #include "hsakmt_virtio_device.h"
++#include <stdlib.h>
+ 
+ pthread_mutex_t dev_mutex = PTHREAD_MUTEX_INITIALIZER;
+ vhsakmt_device_handle dev_list = NULL;
+ 
++/* Disable rocprofiler agent registration by default */
++__attribute__((constructor)) static void vhsakmt_default_disable_rocprofiler_register(void) {
++  setenv("ROCPROFILER_REGISTER_ENABLED", "0", 0);
++}
++
+ vhsakmt_device_handle vhsakmt_dev(void) { return dev_list; }
+ 
+ static HSAKMT_STATUS vhsakmt_openKFD_cmd(vhsakmt_device_handle dev) {
+@@ -92,7 +98,8 @@ static vhsakmt_device_handle vhsakmt_device_init(void) {
+   pthread_mutex_init(&dev->vhsakmt_mutex, NULL);
+   dev_list = dev;
+ 
+-  dev->use_svm = false;
++  dev->use_svm = true;
++  dev->userptr_enabled = false;
+ 
+   pthread_mutex_unlock(&dev_mutex);
+   return dev;
+@@ -109,7 +116,11 @@ static void vhsakmt_init_vars_from_env(void) {
+   char* env_val = NULL;
+ 
+   env_val = getenv("VHSAKMT_USE_SVM");
+-  if (env_val && atoi(env_val)) vhsakmt_dev()->use_svm = true;
++  if (env_val) vhsakmt_dev()->use_svm = (atoi(env_val) != 0);
++
++  /* External host-pointer registration is opt-in. */
++  env_val = getenv("VHSAKMT_USERPTR");
++  if (env_val) vhsakmt_dev()->userptr_enabled = (atoi(env_val) != 0);
+ 
+   env_val = getenv("VHSAKMT_DEBUG_LEVEL");
+   if (env_val) vhsakmt_debug_level = atoi(env_val);
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_proto.h b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_proto.h
+index ee23ea7be5..555ce06528 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_proto.h
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_proto.h
+@@ -115,9 +115,45 @@ enum vhsakmt_ccmd_query_type {
+   VHSAKMT_CCMD_QUERY_SPM_ACQUIRE,
+   VHSAKMT_CCMD_QUERY_SPM_RELEASE,
+   VHSAKMT_CCMD_QUERY_SPM_SET_DST_BUFFER,
++  VHSAKMT_CCMD_QUERY_DRM_DEVICE,
++  VHSAKMT_CCMD_QUERY_DRM_COMMAND,
++  VHSAKMT_CCMD_QUERY_POINTER_INFO_V2,
+ };
+ 
+ #define QUERY_PTR_INFO_MAX_MAPPED_NODES 3
++#define VHSAKMT_DRM_PROTOCOL_VERSION 2
++#define VHSAKMT_DRM_COMMAND_INFO (1u << 0)
++#define VHSAKMT_DRM_INFO_MAX_SIZE (64u * 1024u)
++#define VHSAKMT_WIRE_FEATURE_POINTERS_V2 (1ull << 0)
++#define VHSAKMT_WIRE_FEATURE_USERPTR_LIFETIME (1ull << 1)
++
++typedef struct _query_drm_device_args {
++  uint32_t NodeId;
++  uint32_t version;
++  uint64_t reserved;
++} query_drm_device_args;
++VHSAKMT_STATIC_ASSERT_SIZE(_query_drm_device_args)
++
++typedef struct _query_drm_command_args {
++  uint64_t device_id;
++  uint32_t version;
++  uint32_t command;
++} query_drm_command_args;
++VHSAKMT_STATIC_ASSERT_SIZE(_query_drm_command_args)
++
++typedef struct _query_drm_device_rsp {
++  uint64_t device_id;
++  uint32_t version;
++  uint32_t commands;
++} query_drm_device_rsp;
++VHSAKMT_STATIC_ASSERT_SIZE(_query_drm_device_rsp)
++
++typedef struct _query_pointer_info_args {
++  uint64_t address;
++  uint32_t res_id;
++  uint32_t reserved;
++} query_pointer_info_args;
++VHSAKMT_STATIC_ASSERT_SIZE(_query_pointer_info_args)
+ 
+ typedef struct _query_req_run_time_enable_args {
+   /* void*     rDebug, bypassed by payload */
+@@ -171,6 +207,7 @@ VHSAKMT_STATIC_ASSERT_SIZE(_query_spm_set_dst_buffer_args)
+ typedef struct _query_open_kfd_rsp {
+   uint64_t vm_start;
+   uint64_t vm_size;
++  uint64_t features;
+ } query_open_kfd_rsp;
+ VHSAKMT_STATIC_ASSERT_SIZE(_query_open_kfd_rsp)
+ 
+@@ -207,6 +244,7 @@ struct vhsakmt_ccmd_query_info_req {
+   uint32_t pad;
+   union {
+     uint64_t pointer;
++    query_pointer_info_args pointer_info_args;
+     uint32_t NodeID; /* some query API just need node ID */
+     query_req_run_time_enable_args run_time_enable_args;
+     query_req_node_mem_prop_args node_mem_prop_args;
+@@ -215,6 +253,8 @@ struct vhsakmt_ccmd_query_info_req {
+     query_tile_config tile_config_args;
+     query_open_kfd_args open_kfd_args;
+     query_drm_cmd_write_read_args drm_cmd_write_read_args;
++    query_drm_device_args drm_device_args;
++    query_drm_command_args drm_command_args;
+     query_spm_set_dst_buffer_args spm_set_dst_buffer_args;
+     HSAint32 xnack_mode;
+   };
+@@ -244,6 +284,7 @@ struct vhsakmt_ccmd_query_info_rsp {
+     int32_t xnack_mode;
+     HsaClockCounters clock_counters;
+     query_device_handle_rsp device_handle_rsp;
++    query_drm_device_rsp drm_device_rsp;
+     query_spm_set_dst_buffer_rsp spm_set_dst_buffer_rsp;
+     uint32_t caps;
+     uint64_t pad[9];
+@@ -264,6 +305,7 @@ enum vhsakmt_ccmd_event_type {
+   VHSAKMT_CCMD_EVENT_WAIT_ON_MULTI_EVENTS,
+ 
+   VHSAKMT_CCMD_EVENT_SET_TRAP,
++  VHSAKMT_CCMD_EVENT_CREATE_V2,
+ 
+ };
+ typedef struct _event_req_create_args {
+@@ -421,7 +463,7 @@ typedef struct _memory_reg_mem_with_flag {
+ VHSAKMT_STATIC_ASSERT_SIZE(_memory_reg_mem_with_flag)
+ 
+ typedef struct _memory_amdgpu_import_args {
+-  int64_t dev;
++  uint64_t device_id;
+   uint32_t type;
+   uint32_t shared_handle;
+ } memory_amdgpu_import_args;
+@@ -569,6 +611,8 @@ enum vhsakmt_ccmd_queue_type {
+   VHSAKMT_CCMD_QUEUE_GET_INFO,
+   VHSAKMT_CCMD_QUEUE_SET_CU_MASK,
+   VHSAKMT_CCMD_QUEUE_ALLOC_GWS,
++  VHSAKMT_CCMD_QUEUE_ALLOC_GWS_V2,
++  VHSAKMT_CCMD_QUEUE_CREATE_V2,
+ };
+ 
+ #define VHSAKMT_CCMD_QUEUE_MAX_CU_MASK_SIZE 128
+@@ -595,7 +639,7 @@ typedef struct _queue_req_create {
+   uint32_t SdmaEngineId;
+   uint64_t QueueAddress;
+   uint64_t QueueSizeInBytes;
+-  HsaEvent* Event;
++  uint64_t event_res_id;
+   HsaQueueResource* QueueResource;
+   uint64_t* Queue_write_ptr_aql;
+   uint64_t* Queue_read_ptr_aql;
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_queues.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_queues.c
+index b1cacffbf6..43450c287a 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_queues.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_queues.c
+@@ -50,9 +50,7 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtSetTrapHandler(HSAuint32 NodeId, void* TrapHandle
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_event_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-
+-  return rsp->ret;
++  return vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
+ }
+ 
+ static int vhsakmt_find_aql_rw_bo(vhsakmt_device_handle dev, uint64_t aql_ptr,
+@@ -68,12 +66,12 @@ static int vhsakmt_find_aql_rw_bo(vhsakmt_device_handle dev, uint64_t aql_ptr,
+ }
+ 
+ static int vhsakmt_create_doorbell_blob_bo(vhsakmt_device_handle dev, uint32_t node, size_t size,
+-                                           uint32_t blob_id, uint64_t host_handle,
++                                           uint32_t blob_id,
+                                            vhsakmt_bo_handle* bo_handle) {
+   int r;
+ 
+   r = vhsakmt_create_mappable_blob_bo(dev, size, blob_id, VHSA_BO_QUEUE_DOORBELL,
+-                                      (void*)host_handle, bo_handle);
++                                      NULL, bo_handle);
+   if (r) return r;
+ 
+   r = vhsakmt_set_node_doorbell(dev, node, (*bo_handle)->cpu_addr);
+@@ -82,18 +80,13 @@ static int vhsakmt_create_doorbell_blob_bo(vhsakmt_device_handle dev, uint32_t n
+ }
+ 
+ static int vhsakmt_create_queue_rw_blob_bo(vhsakmt_device_handle dev, size_t size, uint32_t blob_id,
+-                                           uint64_t host_handle, vhsakmt_bo_handle* bo_handle) {
+-  int r;
+-
+-  r = vhsakmt_create_mappable_blob_bo(dev, size, blob_id, VHSA_BO_QUEUE_RW_PTR, NULL, bo_handle);
+-  if (r) return r;
+-
+-  (*bo_handle)->host_addr = (void*)host_handle;
+-  return r;
++                                           vhsakmt_bo_handle* bo_handle) {
++  return vhsakmt_create_mappable_blob_bo(dev, size, blob_id, VHSA_BO_QUEUE_RW_PTR, NULL,
++                                        bo_handle);
+ }
+ 
+ static int vhsakmt_create_queue_blob_bo(vhsakmt_device_handle dev, size_t size, uint32_t blob_id,
+-                                        uint64_t queue_id, vhsakmt_bo_handle rw_bo_handle,
++                                        vhsakmt_bo_handle rw_bo_handle,
+                                         vhsakmt_bo_handle* bo_handle) {
+   int r;
+ 
+@@ -103,7 +96,7 @@ static int vhsakmt_create_queue_blob_bo(vhsakmt_device_handle dev, size_t size,
+ 
+   vhsakmt_insert_bo(dev, *bo_handle, *bo_handle, (*bo_handle)->size);
+ 
+-  (*bo_handle)->queue_id = queue_id;
++  (*bo_handle)->queue_id = (*bo_handle)->real.res_id;
+   (*bo_handle)->rw_bo = rw_bo_handle;
+ 
+   return r;
+@@ -117,12 +110,17 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateQueueV2(HSAuint32 NodeId, HSA_QUEUE_TYPE Ty
+                                               HsaEvent* Event, HsaQueueResource* QueueResource) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
++  if (!QueueResource || (Event && !vhsakmt_event_res_id(Event)))
++    return HSAKMT_STATUS_INVALID_PARAMETER;
++
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   vhsakmt_bo_handle rw_bo_handle = NULL, doorbell_bo, queue_bo, queue_mem_bo;
++  int r = vhsakmt_require_wire_pointers(dev);
++  if (r) return r;
+   struct vhsakmt_ccmd_queue_rsp* rsp;
+   struct vhsakmt_ccmd_queue_req req = {
+       .hdr = VHSAKMT_CCMD(QUEUE, sizeof(struct vhsakmt_ccmd_queue_req)),
+-      .type = VHSAKMT_CCMD_QUEUE_CREATE,
++      .type = VHSAKMT_CCMD_QUEUE_CREATE_V2,
+       .create_queue_args =
+           {
+               .NodeId = NodeId,
+@@ -132,7 +130,7 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateQueueV2(HSAuint32 NodeId, HSA_QUEUE_TYPE Ty
+               .SdmaEngineId = SdmaEngineId,
+               .QueueAddress = (uint64_t)QueueAddress,
+               .QueueSizeInBytes = QueueSizeInBytes,
+-              .Event = Event ? vhsakmt_event_host_handle(Event) : 0,
++              .event_res_id = vhsakmt_event_res_id(Event),
+               .Queue_write_ptr_aql = QueueResource->Queue_write_ptr_aql,
+               .Queue_read_ptr_aql = QueueResource->Queue_read_ptr_aql,
+           },
+@@ -141,7 +139,6 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateQueueV2(HSAuint32 NodeId, HSA_QUEUE_TYPE Ty
+           ? 0
+           : vhsakmt_atomic_inc_return(&dev->next_blob_id), /* For queue doorbell memory map */
+   };
+-  int r;
+ 
+   /* Queue ptr memory is allocated by hsakmtallocmemory in host then mapped into guest, but their
+    * address are not aligned. */
+@@ -170,27 +167,37 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateQueueV2(HSAuint32 NodeId, HSA_QUEUE_TYPE Ty
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_queue_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  if (rsp->ret) {
+-    vhsa_err("%s: queue create failed, ret: %d", __FUNCTION__, rsp->ret);
+-    return rsp->ret;
++  r = vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
++  if (r) {
++    vhsa_err("%s: queue create failed, ret: %d", __FUNCTION__, r);
++    return r;
+   }
++  vHsaQueueResource result = rsp->vqueue_res;
++  if (result.host_doorbell_offset > vhsakmt_doorbell_page_size() - sizeof(uint64_t) ||
++      result.host_doorbell_offset % sizeof(uint32_t))
++    return -EIO;
++  if (Type != HSA_QUEUE_COMPUTE_AQL &&
++      (result.host_write_offset > vhsakmt_queue_page_size() - sizeof(uint64_t) ||
++       result.host_read_offset > vhsakmt_queue_page_size() - sizeof(uint64_t) ||
++       result.host_write_offset % sizeof(uint64_t) ||
++       result.host_read_offset % sizeof(uint64_t)))
++    return -EIO;
+ 
+   /* Map doorbell */
+   if (req.doorbell_blob_id) {
+     r = vhsakmt_create_doorbell_blob_bo(
+-        dev, NodeId, vhsakmt_doorbell_page_size(), req.doorbell_blob_id,
+-        rsp->vqueue_res.host_doorbell - rsp->vqueue_res.host_doorbell_offset, &doorbell_bo);
++        dev, NodeId, vhsakmt_doorbell_page_size(), req.doorbell_blob_id, &doorbell_bo);
+     if (r) {
+-      vhsa_err("%s: doorbell create failed, doorbell: %lx\n", __FUNCTION__,
+-               rsp->vqueue_res.host_doorbell);
++      vhsa_err("%s: doorbell create failed for node %u\n", __FUNCTION__, NodeId);
+       return r;
+     }
+     vhsa_debug("%s: create doorbell: %p, size: 0x%x\n", __FUNCTION__, doorbell_bo->cpu_addr,
+                doorbell_bo->size);
+   }
+ 
+-  QueueResource->Queue_DoorBell_aql = (void*)rsp->vqueue_res.host_doorbell;
++  QueueResource->Queue_DoorBell_aql = VHSA_UINT64_TO_VPTR(
++      VHSA_VPTR_TO_UINT64(vhsakmt_node_doorbell(dev, NodeId)) +
++      result.host_doorbell_offset);
+   vhsa_debug("%s: queue create, Doorbell: %p\n", __FUNCTION__, QueueResource->Queue_DoorBell_aql);
+ 
+   /* Map R/W pointer.
+@@ -199,31 +206,29 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateQueueV2(HSAuint32 NodeId, HSA_QUEUE_TYPE Ty
+    */
+   if (Type != HSA_QUEUE_COMPUTE_AQL) {
+     r = vhsakmt_create_queue_rw_blob_bo(dev, vhsakmt_queue_page_size(), req.rw_ptr_blob_id,
+-                                        rsp->vqueue_res.host_rw_handle, &rw_bo_handle);
++                                        &rw_bo_handle);
+     if (r) {
+-      vhsa_debug("%s: queue rw ptr create failed, host addr: %p\n", __FUNCTION__,
+-                 (void*)rsp->vqueue_res.host_rw_handle);
++      vhsa_debug("%s: queue rw ptr create failed\n", __FUNCTION__);
+       return r;
+     }
+ 
+     QueueResource->Queue_write_ptr_aql = VHSA_UINT64_TO_VPTR(
+-        VHSA_VPTR_TO_UINT64(rw_bo_handle->cpu_addr) + rsp->vqueue_res.host_write_offset);
++      VHSA_VPTR_TO_UINT64(rw_bo_handle->cpu_addr) + result.host_write_offset);
+     QueueResource->Queue_read_ptr_aql = VHSA_UINT64_TO_VPTR(
+-        VHSA_VPTR_TO_UINT64(rw_bo_handle->cpu_addr) + rsp->vqueue_res.host_read_offset);
++      VHSA_VPTR_TO_UINT64(rw_bo_handle->cpu_addr) + result.host_read_offset);
+ 
+-    vhsa_debug("%s: queue create: write ptr gva: %p, read ptr gva: %p, base hva: %lx\n",
+-               __FUNCTION__, QueueResource->Queue_write_ptr_aql, QueueResource->Queue_read_ptr_aql,
+-               rsp->vqueue_res.host_rw_handle);
++    vhsa_debug("%s: queue create: write ptr gva: %p, read ptr gva: %p\n",
++               __FUNCTION__, QueueResource->Queue_write_ptr_aql, QueueResource->Queue_read_ptr_aql);
+   }
+ 
+-  r = vhsakmt_create_queue_blob_bo(dev, QueueSizeInBytes, req.blob_id, rsp->vqueue_res.r.QueueId,
++  r = vhsakmt_create_queue_blob_bo(dev, QueueSizeInBytes, req.blob_id,
+                                    rw_bo_handle, &queue_bo);
+   if (r) {
+-    vhsa_err("%s: queue create failed, queue ID: 0x%lx\n", __FUNCTION__, rsp->vqueue_res.r.QueueId);
++    vhsa_err("%s: queue blob create failed\n", __FUNCTION__);
+     return r;
+   }
+   QueueResource->QueueId = (uint64_t)queue_bo;
+-  return rsp->ret;
++  return HSAKMT_STATUS_SUCCESS;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtCreateQueueExt(HSAuint32 NodeId, HSA_QUEUE_TYPE Type,
+@@ -254,14 +259,26 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtDestroyQueue(HSA_QUEUEID QueueId) {
+ 
+   /* queue ID: vhsakmt_bo_handle -> real queue ID*/
+   vhsakmt_bo_handle bo = (vhsakmt_bo_handle)QueueId;
++  if (!bo) return HSAKMT_STATUS_INVALID_PARAMETER;
++
+   vhsakmt_bo_handle rw_bo = bo->rw_bo;
++  struct vhsakmt_ccmd_queue_req req = {
++      .hdr = VHSAKMT_CCMD(QUEUE, sizeof(req)),
++      .type = VHSAKMT_CCMD_QUEUE_DESTROY,
++      .res_id = bo->real.res_id,
++  };
++  struct vhsakmt_ccmd_queue_rsp* rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(*rsp));
++  if (!rsp) return HSAKMT_STATUS_NO_MEMORY;
++
++  r = vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
++  if (r) return r;
++
++  vhsa_debug("%s: queue res id: %d, queue ID: %" PRIu64 " destroyed\n", __FUNCTION__,
++             bo->real.res_id, bo->queue_id);
+ 
+   r = vhsakmt_bo_free(dev, bo);
+   if (rw_bo) vhsakmt_bo_free(dev, rw_bo);
+ 
+-  vhsa_debug("%s: queue res id: %d, queue ID: %" PRIu64 ", ret = %d\n", __FUNCTION__,
+-             bo->real.res_id, bo->queue_id, r);
+-
+   return r;
+ }
+ 
+@@ -269,6 +286,7 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtUpdateQueue(HSA_QUEUEID QueueId, HSAuint32 QueueP
+                                            HSA_QUEUE_PRIORITY Priority, void* QueueAddress,
+                                            HSAuint64 QueueSize, HsaEvent* Event) {
+   CHECK_VIRTIO_KFD_OPEN();
++  if (!QueueId) return HSAKMT_STATUS_INVALID_PARAMETER;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   vhsakmt_bo_handle bo = (vhsakmt_bo_handle)QueueId;
+@@ -280,7 +298,6 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtUpdateQueue(HSA_QUEUEID QueueId, HSAuint32 QueueP
+       .res_id = bo->real.res_id,
+       .update_queue_args =
+           {
+-              .QueueId = QueueId,
+               .QueuePercentage = QueuePercentage,
+               .Priority = Priority,
+               .QueueAddress = (uint64_t)QueueAddress,
+@@ -296,83 +313,69 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtUpdateQueue(HSA_QUEUEID QueueId, HSAuint32 QueueP
+   rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_queue_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  return rsp->ret;
++  return vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtGetQueueInfo(HSA_QUEUEID QueueId, HsaQueueInfo* QueueInfo) {
+   CHECK_VIRTIO_KFD_OPEN();
+ 
+-  vhsakmt_device_handle dev = vhsakmt_dev();
+-  vhsakmt_bo_handle bo = (vhsakmt_bo_handle)QueueId;
+-  struct vhsakmt_ccmd_queue_rsp* rsp;
+-  struct vhsakmt_ccmd_queue_req req = {
+-      .hdr = VHSAKMT_CCMD(QUEUE, sizeof(struct vhsakmt_ccmd_queue_req)),
+-      .type = VHSAKMT_CCMD_QUEUE_GET_INFO,
+-      .res_id = bo->real.res_id,
+-  };
+-
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_queue_rsp));
+-  if (!rsp) return -ENOMEM;
+-
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  if (rsp->ret) return rsp->ret;
+-
+-  *QueueInfo = rsp->queue_info;
+-
+-  return HSAKMT_STATUS_SUCCESS;
++  if (!QueueId || !QueueInfo) return HSAKMT_STATUS_INVALID_PARAMETER;
++  memset(QueueInfo, 0, sizeof(*QueueInfo));
++  return HSAKMT_STATUS_NOT_SUPPORTED;
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtSetQueueCUMask(HSA_QUEUEID QueueId, HSAuint32 CUMaskCount,
+                                               HSAuint32* QueueCUMask) {
+   CHECK_VIRTIO_KFD_OPEN();
+-  if (CUMaskCount > VHSAKMT_CCMD_QUEUE_MAX_CU_MASK_SIZE) return -EINVAL;
++  if (!QueueId || !QueueCUMask || !CUMaskCount || CUMaskCount % 32 ||
++      CUMaskCount > VHSAKMT_CCMD_QUEUE_MAX_CU_MASK_SIZE)
++    return -EINVAL;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   vhsakmt_bo_handle bo = (vhsakmt_bo_handle)QueueId;
+   struct vhsakmt_ccmd_queue_rsp* rsp;
+-  struct vhsakmt_ccmd_queue_req req = {
++  _Alignas(struct vhsakmt_ccmd_queue_req)
++  uint8_t reqbuf[sizeof(struct vhsakmt_ccmd_queue_req) +
++                 VHSAKMT_CCMD_QUEUE_MAX_CU_MASK_SIZE / 8] = {0};
++  struct vhsakmt_ccmd_queue_req* req = (struct vhsakmt_ccmd_queue_req*)reqbuf;
++  *req = (struct vhsakmt_ccmd_queue_req){
+       .hdr = VHSAKMT_CCMD(QUEUE,
+-                          sizeof(struct vhsakmt_ccmd_queue_req) + CUMaskCount * sizeof(HSAuint32)),
++                          sizeof(struct vhsakmt_ccmd_queue_req) + CUMaskCount / 8),
+       .type = VHSAKMT_CCMD_QUEUE_SET_CU_MASK,
+       .res_id = bo->real.res_id,
+       .CUMaskCount = CUMaskCount,
+   };
+ 
+-  memcpy(req.payload, QueueCUMask, CUMaskCount * sizeof(HSAuint32));
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_queue_rsp));
++  memcpy(req->payload, QueueCUMask, CUMaskCount / 8);
++  rsp = vhsakmt_alloc_rsp(dev, &req->hdr, sizeof(struct vhsakmt_ccmd_queue_rsp));
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  if (rsp->ret) return rsp->ret;
+-
+-  memcpy(QueueCUMask, rsp->payload, CUMaskCount * sizeof(HSAuint32));
+-
+-  return rsp->ret;
++  return vhsakmt_execbuf_rsp(dev, &req->hdr, &rsp->hdr, sizeof(*rsp), __FUNCTION__);
+ }
+ 
+ HSAKMT_STATUS HSAKMTAPI vhsaKmtAllocQueueGWS(HSA_QUEUEID QueueId, HSAuint32 nGWS,
+                                              HSAuint32* firstGWS) {
+   CHECK_VIRTIO_KFD_OPEN();
+-  if (nGWS > VHSAKMT_CCMD_QUEUE_MAX_GWS_SIZE) return -EINVAL;
++  if (!QueueId || !firstGWS || nGWS > VHSAKMT_CCMD_QUEUE_MAX_GWS_SIZE) return -EINVAL;
+ 
+   vhsakmt_device_handle dev = vhsakmt_dev();
+   vhsakmt_bo_handle bo = (vhsakmt_bo_handle)QueueId;
+   struct vhsakmt_ccmd_queue_rsp* rsp;
+   struct vhsakmt_ccmd_queue_req req = {
+-      .hdr = VHSAKMT_CCMD(QUEUE, sizeof(struct vhsakmt_ccmd_queue_req) + nGWS * sizeof(HSAuint32)),
+-      .type = VHSAKMT_CCMD_QUEUE_ALLOC_GWS,
++      .hdr = VHSAKMT_CCMD(QUEUE, sizeof(struct vhsakmt_ccmd_queue_req)),
++      .type = VHSAKMT_CCMD_QUEUE_ALLOC_GWS_V2,
+       .res_id = bo->real.res_id,
+       .nGWS = nGWS,
+   };
+ 
+-  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, sizeof(struct vhsakmt_ccmd_queue_rsp));
++  size_t rsp_len = sizeof(*rsp) + sizeof(*firstGWS);
++  rsp = vhsakmt_alloc_rsp(dev, &req.hdr, rsp_len);
+   if (!rsp) return -ENOMEM;
+ 
+-  vhsakmt_execbuf_cpu(dev, &req.hdr, __FUNCTION__);
+-  if (rsp->ret) return rsp->ret;
++  int ret = vhsakmt_execbuf_rsp(dev, &req.hdr, &rsp->hdr, rsp_len, __FUNCTION__);
++  if (ret) return ret;
+ 
+-  memcpy(firstGWS, rsp->payload, nGWS * sizeof(HSAuint32));
++  memcpy(firstGWS, rsp->payload, sizeof(*firstGWS));
+ 
+-  return rsp->ret;
++  return HSAKMT_STATUS_SUCCESS;
+ }
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_topology.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_topology.c
+index 0b8869c40a..5c2812a173 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_topology.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_topology.c
+@@ -157,6 +157,12 @@ HSAKMT_STATUS HSAKMTAPI vhsaKmtGetNodeProperties(HSAuint32 NodeId,
+ 
+   memcpy(NodeProperties, &rsp->node_props, sizeof(HsaNodeProperties));
+ 
++  /* gws not supported currently */
++  NodeProperties->NumGws = 0;
++
++  /* svm/hmm (kfd svm ioctls) not proxied over virtio */
++  NodeProperties->Capability.ui32.SVMAPISupported = 0;
++
+   r = vhsakmt_set_node_props(dev, NodeId, NodeProperties);
+   if (r) return r;
+ 
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_vm.c b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_vm.c
+index 86aa0a1a66..c3fc115076 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_vm.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/hsakmt_virtio_vm.c
+@@ -46,7 +46,12 @@ int vhsakmt_reserve_va(uint64_t start, uint64_t size) {
+   return 0;
+ }
+ 
+-void vhsakmt_dereserve_va(uint64_t start, uint64_t size) { munmap((void*)start, size); }
++void vhsakmt_dereserve_va(uint64_t start, uint64_t size) {
++  vhsakmt_device_handle dev = vhsakmt_dev();
++  if (dev && dev->vgdev && __atomic_load_n(&dev->vgdev->transport_error, __ATOMIC_ACQUIRE))
++    return;
++  munmap((void*)start, size);
++}
+ 
+ void vhsakmt_set_scratch_area(vhsakmt_device_handle dev, uint32_t node, uint64_t start,
+                               uint64_t size) {
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/include/linux/virtgpu_drm.h b/projects/rocr-runtime/libhsakmt/src/virtio/include/linux/virtgpu_drm.h
+index d7625a551a..edac35b398 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/include/linux/virtgpu_drm.h
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/include/linux/virtgpu_drm.h
+@@ -98,6 +98,9 @@ struct drm_virtgpu_execbuffer {
+ #define VIRTGPU_PARAM_CONTEXT_INIT 6 /* DRM_VIRTGPU_CONTEXT_INIT */
+ #define VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs 7 /* Bitmask of supported capability set ids */
+ #define VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME 8 /* Ability to set debug name from userspace */
++#define VIRTGPU_PARAM_BLOB_ALIGNMENT 9 /* Device alignment requirements for blobs */
++#define VIRTGPU_PARAM_USERPTR 10 /* CREATE_BLOB userptr field is supported */
++#define VIRTGPU_PARAM_BLOB_READONLY 11 /* VIRTGPU_BLOB_FLAG_USE_READONLY is honored */
+ 
+ struct drm_virtgpu_getparam {
+ 	__u64 param;
+@@ -185,7 +188,7 @@ struct drm_virtgpu_resource_create_blob {
+ #define VIRTGPU_BLOB_FLAG_USE_MAPPABLE     0x0001
+ #define VIRTGPU_BLOB_FLAG_USE_SHAREABLE    0x0002
+ #define VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+-#define VIRTGPU_BLOB_FLAG_USE_USERPTR      0x0008
++#define VIRTGPU_BLOB_FLAG_USE_READONLY     0x0008
+ 	/* zero is invalid blob_mem */
+ 	__u32 blob_mem;
+ 	__u32 blob_flags;
+@@ -201,8 +204,17 @@ struct drm_virtgpu_resource_create_blob {
+ 	__u32 cmd_size;
+ 	__u64 cmd;
+ 	__u64 blob_id;
+-  __u64 blob_userptr;
+-  __s64 offset;
++
++#define DRM_VIRTGPU_BLOB_FLAG_HINT_DEFER_MAPPING	0x0001
++	__u32 blob_hints;
++	__u32 pad2;
++
++	/*
++	 * Non-zero selects the userptr path and is valid only with
++	 * VIRTGPU_BLOB_MEM_GUEST. Must be 0 otherwise. Probe
++	 * VIRTGPU_PARAM_USERPTR before using this field.
++	 */
++	__u64 userptr;
+ };
+ 
+ #define VIRTGPU_CONTEXT_PARAM_CAPSET_ID       0x0001
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/libhsakmt_virtio.ver b/projects/rocr-runtime/libhsakmt/src/virtio/libhsakmt_virtio.ver
+index 7e6f1f71d7..65acad6428 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/libhsakmt_virtio.ver
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/libhsakmt_virtio.ver
+@@ -50,6 +50,8 @@ vhsaKmtRegisterGraphicsHandleToNodes;
+ vhsaKmtMapGraphicHandle;
+ vhsaKmtUnmapGraphicHandle;
+ vhsaKmtExportDMABufHandle;
++vhsaKmtVirtioMapHandleToVA;
++vhsaKmtVirtioUnmapHandleFromVA;
+ vhsaKmtGetRuntimeCapabilities;
+ vhsaKmtModelEnabled;
+ vhsaKmtOpenSMI;
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.c b/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.c
+index 1d65763511..55f7e494cb 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.c
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.c
+@@ -24,6 +24,7 @@
+ #include <libsync.h>
+ #include <stdbool.h>
+ #include <stddef.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/mman.h>
+ #include <fcntl.h>
+@@ -32,6 +33,8 @@
+ 
+ #define SHMEM_SZ (80 * 0x1000)
+ 
++static int transport_failure;
++
+ static int set_context(int fd) {
+   struct drm_virtgpu_context_set_param params[] = {
+       {VIRTGPU_CONTEXT_PARAM_CAPSET_ID, VIRGL_RENDERER_CAPSET_HSAKMT},
+@@ -47,6 +50,8 @@ static int set_context(int fd) {
+ 
+ int virtio_gpu_map_handle(struct virtio_gpu_device* vgdev, uint32_t handle, uint64_t size,
+                           void** addr, void* fixed_map) {
++  int error = __atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (error) return error;
+   struct drm_virtgpu_map args = {
+       .handle = handle,
+   };
+@@ -103,6 +108,7 @@ struct virtio_gpu_device* virtio_gpu_init(int fd, uint32_t context_id) {
+   struct virtio_gpu_device* vgdev;
+   int r;
+ 
++  if (__atomic_load_n(&transport_failure, __ATOMIC_ACQUIRE)) return NULL;
+   r = set_context(fd);
+ 
+   if (r) return NULL;
+@@ -111,6 +117,15 @@ struct virtio_gpu_device* virtio_gpu_init(int fd, uint32_t context_id) {
+   if (!vgdev) return NULL;
+ 
+   vgdev->fd = fd;
++  vgdev->retained_fence = -1;
++
++  int readonly = 0;
++  struct drm_virtgpu_getparam param = {
++      .param = VIRTGPU_PARAM_BLOB_READONLY,
++      .value = (uintptr_t)&readonly,
++  };
++  if (!virtio_gpu_ioctl(fd, VIRTGPU_GETPARAM, &param))
++    vgdev->blob_readonly = readonly != 0;
+ 
+   vgdev->reqbuf = calloc(1, SHMEM_SZ);
+   if (!vgdev->reqbuf) {
+@@ -131,6 +146,7 @@ struct virtio_gpu_device* virtio_gpu_init(int fd, uint32_t context_id) {
+ }
+ 
+ void virtio_gpu_close(struct virtio_gpu_device* vgdev) {
++  if (__atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE)) return;
+   virtio_gpu_unmap(vgdev->shmem, SHMEM_SZ);
+   virtio_gpu_bo_close(vgdev, vgdev->shmem_handle);
+ 
+@@ -146,6 +162,7 @@ void* virtio_gpu_alloc_rsp(struct virtio_gpu_device* vgdev, struct virtio_gpu_cc
+                            uint32_t size) {
+   uint32_t off;
+ 
++  if (__atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE)) return NULL;
+   pthread_mutex_lock(&vgdev->rsp_lock);
+ 
+   size = VHSA_ALIGN_UP(size, 8);
+@@ -178,7 +195,7 @@ static int virtio_gpu_execbuffer_locked(struct virtio_gpu_device* vgdev, void* c
+       .command = (uintptr_t)cmd,
+       .bo_handles = (uintptr_t)handles,
+       .num_bo_handles = num_handles,
+-      .fence_fd = *fence_fd,
++      .fence_fd = fence_fd ? *fence_fd : -1,
+       .ring_idx = ring_idx,
+       .syncobj_stride = sizeof(struct drm_virtgpu_execbuffer_syncobj),
+       .num_in_syncobjs = num_in_syncobjs,
+@@ -213,7 +230,8 @@ static int virtio_gpu_add_cmd(struct virtio_gpu_device* vgdev, struct virtio_gpu
+   req->seqno = ++vgdev->next_seqno;
+   int r;
+ 
+-  if (vgdev->reqbuf_len + req->len > sizeof(vgdev->reqbuf)) {
++  if (req->len < sizeof(*req) || req->len > SHMEM_SZ) return -EINVAL;
++  if (vgdev->reqbuf_len > SHMEM_SZ || req->len > SHMEM_SZ - vgdev->reqbuf_len) {
+     r = virtio_gpu_flush_locked(vgdev, NULL);
+     if (r) return r;
+   }
+@@ -227,43 +245,69 @@ static int virtio_gpu_add_cmd(struct virtio_gpu_device* vgdev, struct virtio_gpu
+ 
+ static inline bool fence_before(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+ 
+-static void virtio_gpu_seqno_sync(struct virtio_gpu_device* vgdev,
+-                                  struct virtio_gpu_ccmd_req* req) {
+-  while (fence_before(vgdev->shmem->base.seqno, req->seqno)) sched_yield();
+-}
+-
+ int virtio_gpu_exec_cmd(struct virtio_gpu_device* vgdev, struct virtio_gpu_ccmd_req* req,
+                         bool sync) {
+   int r = 0;
+-  int fence;
++  int fence = -1;
++
++  if (!sync) return -EOPNOTSUPP;
++  if (!req || req->len < sizeof(*req) || req->len > SHMEM_SZ) return -EINVAL;
+ 
+   pthread_mutex_lock(&vgdev->eb_lock);
++  r = __atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (r) goto out;
+ 
+   r = virtio_gpu_add_cmd(vgdev, req);
+-
+-  if (r || !sync) goto out;
++  if (r) goto failed;
+ 
+   r = virtio_gpu_flush_locked(vgdev, &fence);
++  if (r) {
++    r = errno ? -errno : -EIO;
++    goto failed;
++  }
++  if (fence < 0) {
++    r = -EPROTO;
++    goto failed;
++  }
+ 
+-out:
+-  pthread_mutex_unlock(&vgdev->eb_lock);
+-  if (r) return r;
++  do {
++    r = sync_wait(fence, -1);
++  } while (r < 0 && (errno == EINTR || errno == EAGAIN));
++  if (r < 0) {
++    r = errno ? -errno : -EIO;
++    goto failed;
++  }
++  close(fence);
++  fence = -1;
+ 
+-  if (sync) {
+-    sync_wait(fence, -1);
+-    close(fence);
+-    virtio_gpu_seqno_sync(vgdev, req);
++  if (fence_before(__atomic_load_n(&vgdev->shmem->base.seqno, __ATOMIC_ACQUIRE), req->seqno)) {
++    r = -EPROTO;
++    goto failed;
+   }
++  goto out;
+ 
++failed:
++  vgdev->retained_fence = fence;
++  __atomic_store_n(&vgdev->transport_error, r, __ATOMIC_RELEASE);
++  __atomic_store_n(&transport_failure, r, __ATOMIC_RELEASE);
++  fprintf(stderr, "virtio ROCm: completion failed (%d); transport retained until process exit\n", r);
++  vgdev->reqbuf_len = 0;
++  vgdev->reqbuf_cnt = 0;
++out:
++  pthread_mutex_unlock(&vgdev->eb_lock);
+   return r;
+ }
+ 
+ int virtio_gpu_create_blob(struct virtio_gpu_device* vgdev,
+                            struct drm_virtgpu_resource_create_blob* args) {
++  int error = __atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (error) return error;
+   return virtio_gpu_ioctl(vgdev->fd, VIRTGPU_RESOURCE_CREATE_BLOB, args);
+ }
+ 
+ int virtio_gpu_destroy_handle(struct virtio_gpu_device* vgdev, uint32_t bo_handle) {
++  int error = __atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (error) return error;
+   struct drm_gem_close args = {
+       .handle = bo_handle,
+   };
+@@ -272,6 +316,8 @@ int virtio_gpu_destroy_handle(struct virtio_gpu_device* vgdev, uint32_t bo_handl
+ }
+ 
+ int virtio_gpu_res_id(struct virtio_gpu_device* vgdev, uint32_t handle, uint32_t* res_id) {
++  int error = __atomic_load_n(&vgdev->transport_error, __ATOMIC_ACQUIRE);
++  if (error) return error;
+   struct drm_virtgpu_resource_info args = {
+       .bo_handle = handle,
+   };
+@@ -300,6 +346,8 @@ int virtio_gpu_kfd_open(void) {
+   int num_devices = 0;
+   int i, fd, ret;
+ 
++  ret = __atomic_load_n(&transport_failure, __ATOMIC_ACQUIRE);
++  if (ret) return ret;
+   num_devices = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
+   if (num_devices <= 0) return -1;
+ 
+diff --git a/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.h b/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.h
+index f31333ad6a..8157dfa83d 100644
+--- a/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.h
++++ b/projects/rocr-runtime/libhsakmt/src/virtio/virtio_gpu.h
+@@ -24,12 +24,13 @@
+ #define VIRTIO_GPU_H
+ 
+ #include <pthread.h>
++#include <stdbool.h>
+ #include <stdint.h>
+ #include <xf86drm.h>
+ 
+ #include "virtgpu_drm.h"
+ 
+-#define VIRGL_RENDERER_CAPSET_HSAKMT 8
++#define VIRGL_RENDERER_CAPSET_HSAKMT 10
+ #define VIRTGPU_DRM_CONTEXT_AMDGPU 1
+ #define VHSA_MAX_DEVICES 10
+ 
+@@ -84,6 +85,9 @@ struct virtio_gpu_shmem {
+ 
+ struct virtio_gpu_device {
+   int fd;
++  bool blob_readonly;
++  int transport_error;
++  int retained_fence;
+ 
+   struct virtio_gpu_shmem* shmem;
+   uint32_t shmem_handle;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/driver/virtio/amd_kfd_virtio_driver.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/driver/virtio/amd_kfd_virtio_driver.cpp
+index 017bbd41ac..1e60447ec8 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/driver/virtio/amd_kfd_virtio_driver.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/driver/virtio/amd_kfd_virtio_driver.cpp
+@@ -50,6 +50,7 @@
+ #include "core/inc/amd_gpu_agent.h"
+ #include "core/inc/amd_memory_region.h"
+ #include "core/inc/runtime.h"
++#include "core/util/os.h"
+ 
+ extern r_debug _amdgpu_r_debug;
+ 
+@@ -70,6 +71,22 @@ __forceinline uint64_t drm_perm(hsa_access_permission_t perm) {
+   }
+ }
+ 
++__forceinline HSA_QUEUE_PRIORITY HsaInternalToKfdPriority(
++    HSA::hsa_amd_queue_priority_internal_t priority) {
++  switch (priority) {
++  case HSA::HSA_AMD_QUEUE_PRIORITY_LOW:
++    return HSA_QUEUE_PRIORITY_MINIMUM;
++  case HSA::HSA_AMD_QUEUE_PRIORITY_NORMAL:
++    return HSA_QUEUE_PRIORITY_NORMAL;
++  case HSA::HSA_AMD_QUEUE_PRIORITY_HIGH:
++    return HSA_QUEUE_PRIORITY_HIGH;
++  case HSA::HSA_AMD_QUEUE_PRIORITY_MAXIMUM:
++    return HSA_QUEUE_PRIORITY_MAXIMUM;
++  default:
++    return HSA_QUEUE_PRIORITY_NORMAL;
++  }
++}
++
+ KfdVirtioDriver::KfdVirtioDriver(std::string devnode_name)
+     : core::Driver(core::DriverType::KFD_VIRTIO, std::move(devnode_name)) {}
+ 
+@@ -195,7 +212,17 @@ hsa_status_t KfdVirtioDriver::GetDeviceHandle(uint32_t node_id, void** device_ha
+ }
+ 
+ hsa_status_t KfdVirtioDriver::GetDeviceFd(uint32_t node_id, int *fd) const {
+-  return HSA_STATUS_ERROR;
++  assert(fd != nullptr);
++
++  amdgpu_device_handle device_handle;
++  if (GetDeviceHandle(node_id, reinterpret_cast<void**>(&device_handle)) != HSA_STATUS_SUCCESS)
++    return HSA_STATUS_ERROR;
++
++  const int device_fd = vamdgpu_device_get_fd(device_handle);
++  if (device_fd < 0) return HSA_STATUS_ERROR;
++
++  *fd = device_fd;
++  return HSA_STATUS_SUCCESS;
+ }
+ 
+ 
+@@ -437,9 +464,13 @@ hsa_status_t KfdVirtioDriver::MakeMemoryUnresident(const void* mem) const {
+ hsa_status_t KfdVirtioDriver::CreateQueue(uint32_t node_id, HSA_QUEUE_TYPE type, uint32_t queue_pct,
+                                           HSA::hsa_amd_queue_priority_internal_t priority, uint32_t sdma_engine_id,
+                                           void* queue_addr, uint64_t queue_size_bytes,
+-                                          HsaEvent* event, HsaQueueResource& queue_resource) const {
+-  if (vhsaKmtCreateQueueExt(node_id, type, queue_pct, priority, sdma_engine_id, queue_addr,
+-                            queue_size_bytes, event, &queue_resource) != HSAKMT_STATUS_SUCCESS)
++                                          uint64_t queue_metadata_size_bytes, HsaEvent* event,
++                                          HsaQueueResource& queue_resource) const {
++  HSA_QUEUE_PRIORITY kfd_priority = HsaInternalToKfdPriority(priority);
++
++  if (vhsaKmtCreateQueueV2(node_id, type, queue_pct, kfd_priority, sdma_engine_id, queue_addr,
++                           queue_size_bytes, queue_metadata_size_bytes, event,
++                           &queue_resource) != HSAKMT_STATUS_SUCCESS)
+     return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+ 
+   return HSA_STATUS_SUCCESS;
+@@ -454,17 +485,29 @@ hsa_status_t KfdVirtioDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
+ hsa_status_t KfdVirtioDriver::UpdateQueue(HSA_QUEUEID queue_id, uint32_t queue_percentage,
+                                           HSA::hsa_amd_queue_priority_internal_t priority, void* queue_mem,
+                                           uint64_t queue_size, HsaEvent* event) const {
+-  return HSA_STATUS_ERROR;
++  HSA_QUEUE_PRIORITY kfd_priority = HsaInternalToKfdPriority(priority);
++
++  if (vhsaKmtUpdateQueue(queue_id, queue_percentage, kfd_priority, queue_mem, queue_size, event) !=
++      HSAKMT_STATUS_SUCCESS)
++    return HSA_STATUS_ERROR;
++
++  return HSA_STATUS_SUCCESS;
+ }
+ 
+ hsa_status_t KfdVirtioDriver::SetQueueCUMask(HSA_QUEUEID queue_id, uint32_t num_cu_mask,
+                                              uint32_t* cu_mask) const {
+-  return HSA_STATUS_ERROR;
++  if (vhsaKmtSetQueueCUMask(queue_id, num_cu_mask, cu_mask) != HSAKMT_STATUS_SUCCESS)
++    return HSA_STATUS_ERROR;
++
++  return HSA_STATUS_SUCCESS;
+ }
+ 
+ hsa_status_t KfdVirtioDriver::AllocQueueGWS(HSA_QUEUEID queue_id, uint32_t num_GWS,
+                                             uint32_t* GWS) const {
+-  return HSA_STATUS_ERROR;
++  if (vhsaKmtAllocQueueGWS(queue_id, num_GWS, GWS) != HSAKMT_STATUS_SUCCESS)
++    return HSA_STATUS_ERROR;
++
++  return HSA_STATUS_SUCCESS;
+ }
+ 
+ hsa_status_t KfdVirtioDriver::ExportMemoryHandle(const core::Agent& agent, const core::DriverMemoryHandle& handle,
+@@ -480,7 +523,7 @@ hsa_status_t KfdVirtioDriver::ExportMemoryHandle(const core::Agent& agent, const
+     int dmabuf_fd_res = -1;
+     size_t offset_res = 0;
+     HSAKMT_STATUS status =
+-        vhsaKmtExportDMABufHandle(const_cast<void*>(reinterpret_cast<const void*>(&handle)), handle.size,
++        vhsaKmtExportDMABufHandle(reinterpret_cast<void*>(handle.handle), handle.size,
+                                   &dmabuf_fd_res, &offset_res);
+     if (status != HSAKMT_STATUS_SUCCESS) {
+       if (status == HSAKMT_STATUS_INVALID_PARAMETER) {
+@@ -542,6 +585,18 @@ hsa_status_t KfdVirtioDriver::Map(const core::DriverMemoryHandle& handle, void*
+                        drm_perm(perms), AMDGPU_VA_OP_MAP) != 0)
+     return HSA_STATUS_ERROR;
+ 
++  // Back the reserved guest VA with the physical allocation on the CPU side.
++  // virtio-gpu guests reach host device memory through a mappable blob; map the
++  // owning allocation's blob at the reserved VA (MAP_FIXED) so CPU accesses to
++  // VMM-mapped memory (e.g. the HIP memory-pool / VmHeap sub-allocator) resolve,
++  // mirroring the GPU-side amdgpu VA mapping established above.
++  if (vhsaKmtVirtioMapHandleToVA(reinterpret_cast<void*>(handle.handle), mem, size) !=
++      HSAKMT_STATUS_SUCCESS) {
++    vamdgpu_bo_va_op(ldrm_bo, offset, size, reinterpret_cast<uint64_t>(mem), 0,
++                     AMDGPU_VA_OP_UNMAP);
++    return HSA_STATUS_ERROR;
++  }
++
+   return HSA_STATUS_SUCCESS;
+ }
+ 
+@@ -551,6 +606,9 @@ hsa_status_t KfdVirtioDriver::Unmap(const core::DriverMemoryHandle& handle, void
+   if (!ldrm_bo)
+     return HSA_STATUS_ERROR;
+ 
++  // Tear down the CPU-side blob mapping established in Map().
++  vhsaKmtVirtioUnmapHandleFromVA(mem, size);
++
+   if (vamdgpu_bo_va_op(ldrm_bo, offset, size, reinterpret_cast<uint64_t>(mem), 0,
+                       AMDGPU_VA_OP_UNMAP) != 0)
+     return HSA_STATUS_ERROR;
+@@ -561,10 +619,47 @@ hsa_status_t KfdVirtioDriver::Unmap(const core::DriverMemoryHandle& handle, void
+ hsa_status_t KfdVirtioDriver::CreateShareableHandle(void* va, void* mem, size_t size,
+                                                     const core::Agent& agent,
+                                                     core::DriverMemoryHandle* handle, uint64_t* offset) {
+-  return HSA_STATUS_ERROR;
++  (void)va;
++
++  // Create a shareable handle by exporting the owning allocation to a dmabuf,
++  // importing it into libdrm to obtain a bo handle that holds a reference, then
++  // re-exporting a durable dmabuf fd used for per-agent import in
++  // MappedHandleAllowedAgent. Mirrors KfdDriver::CreateShareableHandle but uses
++  // the virtio thunk primitives.
++  //
++  // Note: unlike the KFD path, no CPU mmap offset is computed. virtio-gpu guests
++  // cannot mmap the host BO without guest-kernel support, so CPU-side access is
++  // intentionally skipped (see Runtime::MappedHandleAllowedAgent::EnableAccess).
++  int source_fd = -1;
++  core::DriverMemoryHandle src_alloc = {};
++  src_alloc.handle = reinterpret_cast<uint64_t>(mem);
++  src_alloc.size = size;
++
++  hsa_status_t ret =
++      ExportMemoryHandle(agent, src_alloc, core::ShareType::DMABUF_FD, 0, &source_fd, offset);
++  if (ret != HSA_STATUS_SUCCESS) return ret;
++
++  core::DriverMemoryHandle target_handle = {};
++  ret = ImportMemoryHandle(agent, &target_handle, core::ShareType::DMABUF_FD, &source_fd, mem);
++  rocr::os::DmaBufClose(source_fd);
++  if (ret != HSA_STATUS_SUCCESS) return ret;
++
++  int shareable_fd = -1;
++  core::DriverMemoryHandle reexport_src = {}; reexport_src.handle = reinterpret_cast<uint64_t>(mem); reexport_src.size = size; ret = ExportMemoryHandle(agent, reexport_src, core::ShareType::DMABUF_FD, 0, &shareable_fd);
++  if (ret != HSA_STATUS_SUCCESS) {
++    DestroyMemoryHandle(&target_handle);
++    return ret;
++  }
++
++  handle->handle = target_handle.handle;
++  handle->dmabuf_fd = shareable_fd;
++  handle->size = size;
++  return HSA_STATUS_SUCCESS;
+ }
+ 
+ hsa_status_t KfdVirtioDriver::DestroyMemoryHandle(core::DriverMemoryHandle* handle) {
++  if (handle->dmabuf_fd >= 0) rocr::os::DmaBufClose(handle->dmabuf_fd);
++
+   const auto ldrm_bo = reinterpret_cast<amdgpu_bo_handle>(handle->handle);
+   if (!ldrm_bo)
+     return HSA_STATUS_ERROR;
+@@ -573,7 +668,7 @@ hsa_status_t KfdVirtioDriver::DestroyMemoryHandle(core::DriverMemoryHandle* hand
+   if (ret)
+     return HSA_STATUS_ERROR;
+ 
+-  handle = {};
++  *handle = {};
+   return HSA_STATUS_SUCCESS;
+ }
+ 
+@@ -583,17 +678,33 @@ hsa_status_t KfdVirtioDriver::GetTileConfig(uint32_t node_id, HsaGpuTileConfig*
+   return HSA_STATUS_SUCCESS;
+ }
+ 
+-hsa_status_t KfdVirtioDriver::SPMAcquire(uint32_t node_id) const { return HSA_STATUS_ERROR; }
++hsa_status_t KfdVirtioDriver::SPMAcquire(uint32_t node_id) const {
++  if (vhsaKmtSPMAcquire(node_id) != HSAKMT_STATUS_SUCCESS) return HSA_STATUS_ERROR;
++
++  return HSA_STATUS_SUCCESS;
++}
++
++hsa_status_t KfdVirtioDriver::SPMRelease(uint32_t node_id) const {
++  if (vhsaKmtSPMRelease(node_id) != HSAKMT_STATUS_SUCCESS) return HSA_STATUS_ERROR;
+ 
+-hsa_status_t KfdVirtioDriver::SPMRelease(uint32_t node_id) const { return HSA_STATUS_ERROR; }
++  return HSA_STATUS_SUCCESS;
++}
+ 
+ hsa_status_t KfdVirtioDriver::SPMSetDestBuffer(uint32_t node_id, uint32_t size, uint32_t* timeout,
+                                                uint32_t* size_copied, void* dest,
+                                                bool* is_data_loss) const {
+-  return HSA_STATUS_ERROR;
++  if (vhsaKmtSPMSetDestBuffer(node_id, size, timeout, size_copied, dest, is_data_loss) !=
++      HSAKMT_STATUS_SUCCESS)
++    return HSA_STATUS_ERROR;
++
++  return HSA_STATUS_SUCCESS;
+ }
+ 
+-hsa_status_t KfdVirtioDriver::OpenSMI(uint32_t node_id, int* fd) const { return HSA_STATUS_ERROR; }
++hsa_status_t KfdVirtioDriver::OpenSMI(uint32_t node_id, int* fd) const {
++  if (vhsaKmtOpenSMI(node_id, fd) != HSAKMT_STATUS_SUCCESS) return HSA_STATUS_ERROR;
++
++  return HSA_STATUS_SUCCESS;
++}
+ 
+ hsa_status_t KfdVirtioDriver::GetWallclockFrequency(uint32_t node_id, uint64_t* frequency) const {
+   assert(frequency != nullptr);
+@@ -622,7 +733,7 @@ hsa_status_t KfdVirtioDriver::GetQueueSaveAreaInfo(HSA_QUEUEID queue_id, void**
+ 
+   HsaQueueInfo queue_info = {};
+ 
+-  HSAKMT_STATUS status = HSAKMT_CALL(hsaKmtGetQueueInfo(queue_id, &queue_info));
++  HSAKMT_STATUS status = vhsaKmtGetQueueInfo(queue_id, &queue_info);
+   if (status != HSAKMT_STATUS_SUCCESS) {
+     return HSA_STATUS_ERROR;
+   }
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_virtio_driver.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_virtio_driver.h
+index 96482646e7..f2f04361dc 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_virtio_driver.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_virtio_driver.h
+@@ -92,8 +92,8 @@ class KfdVirtioDriver final : public core::Driver {
+   hsa_status_t MakeMemoryUnresident(const void* mem) const override;
+   hsa_status_t CreateQueue(uint32_t node_id, HSA_QUEUE_TYPE type, uint32_t queue_pct,
+                            HSA::hsa_amd_queue_priority_internal_t priority, uint32_t sdma_engine_id, void* queue_addr,
+-                           uint64_t queue_size_bytes, HsaEvent* event,
+-                           HsaQueueResource& queue_resource) const override;
++                           uint64_t queue_size_bytes, uint64_t queue_metadata_size_bytes,
++                           HsaEvent* event, HsaQueueResource& queue_resource) const override;
+   hsa_status_t DestroyQueue(HSA_QUEUEID queue_id) const override;
+   hsa_status_t UpdateQueue(HSA_QUEUEID queue_id, uint32_t queue_percentage,
+                            HSA::hsa_amd_queue_priority_internal_t priority, void* queue_mem, uint64_t queue_size,
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/thunk_loader.h b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/thunk_loader.h
+index 2819f789fb..529c5847f1 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/thunk_loader.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/thunk_loader.h
+@@ -439,6 +439,7 @@ class ThunkLoader {
+     bool IsWinDxg() const { return is_win_dxg_; }
+     bool IsWslDxg() const { return is_wsl_dxg_; }
+     bool IsDTIF() const { return is_dtif_; }
++    bool IsVirtio() const { return is_virtio_; }
+     bool IsSharedLibraryLoaded() const { return is_loaded_; }
+     void* ThunkHandle() const { return thunk_handle; }
+ 
+@@ -572,6 +573,7 @@ class ThunkLoader {
+     bool is_win_dxg_;
+     bool is_wsl_dxg_;
+     bool is_dtif_;
++    bool is_virtio_;
+     bool is_loaded_;
+ };
+ 
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_loader_context.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_loader_context.cpp
+index 89a65765ca..e0e17b63d4 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_loader_context.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_loader_context.cpp
+@@ -354,7 +354,9 @@ bool RegionMemory::Freeze() {
+ 
+   const bool isGpuDevice = (agent->device_type() == core::Agent::kAmdGpuDevice);
+   const bool isLargeBarDisabled = isGpuDevice && !reinterpret_cast<AMD::GpuAgent*>(agent)->LargeBarEnabled();
+-  const bool shouldDmaCopy = isGpuDevice && (isLargeBarDisabled || size_ > code_object_dmacopy_size);
++  const bool isVirtio = core::Runtime::runtime_singleton_->thunkLoader()->IsVirtio();
++  const bool shouldDmaCopy =
++      isGpuDevice && (isVirtio || isLargeBarDisabled || size_ > code_object_dmacopy_size);
+ 
+   if (shouldDmaCopy) {
+       if (HSA_STATUS_SUCCESS != agent->DmaCopy(ptr_, host_ptr_, size_)) return false;
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_memory_region.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_memory_region.cpp
+index 2c4bb9b7b5..d6e881ed95 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_memory_region.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_memory_region.cpp
+@@ -374,6 +374,11 @@ hsa_amd_memory_pool_access_t MemoryRegion::GetAccessInfo(
+   // guaranteed to be HSA_HEAPTYPE_FRAME_BUFFER_PUBLIC
+ 
+   if (IsLocalMemory()) {
++    if (agent.device_type() == core::Agent::kAmdCpuDevice &&
++        core::Runtime::runtime_singleton_->thunkLoader()->IsVirtio()) {
++      return HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED;
++    }
++
+     // Return disallowed by default if memory is coarse
+     // grained or extended scope fine grained without regard to link type
+     if (fine_grain() == false) {
+@@ -458,7 +463,13 @@ hsa_status_t MemoryRegion::AllowAccess(uint32_t num_agents,
+                                                  &agent_count, &accessible,
+                                                  &blockInfo) == HSA_STATUS_SUCCESS) {
+     /*  Thunk may return type = HSA_EXT_POINTER_TYPE_UNKNOWN for userptrs */
++    /*  Only adopt the owning block's base/length when the block info is VALID. On the
++     *  virtio path QueryPointerInfo can intermittently report a degenerate {base=0,
++     *  length=0} block for a valid whole-BO pointer; adopting it would overwrite the
++     *  caller's valid (ptr,size) with (NULL,0) and make MakeMemoryResident/map fail
++     *  with OUT_OF_RESOURCES, surfacing as a spurious hipStreamCreate/hipMalloc OOM. */
+     if (info.type != HSA_EXT_POINTER_TYPE_UNKNOWN &&
++        blockInfo.base != nullptr && blockInfo.length != 0 &&
+         (blockInfo.length != size || info.sizeInBytes != size)) {
+       for (int i = 0; i < num_agents; i++) union_agents.push_back(agents[i].handle);
+       for (int i = 0; i < agent_count; i++) union_agents.push_back(accessible[i].handle);
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_topology.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_topology.cpp
+index 78095dc250..925e03f591 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_topology.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_topology.cpp
+@@ -100,12 +100,17 @@ const std::array<std::function<hsa_status_t(std::unique_ptr<core::Driver>&)>,
+ };
+ 
+ void DiscoverDrivers() {
++  // virtio redirects hsaKmtOpenKFD to vhsaKmt*, so the native KfdDriver::Open()
++  // also succeeds; skip it under virtio to avoid a duplicate KFD+virtio topology.
++  const bool is_virtio = core::Runtime::runtime_singleton_->thunkLoader()->IsVirtio();
+   for (const auto& discover_driver_fn : discover_driver_funcs) {
+     std::unique_ptr<core::Driver> driver;
+     hsa_status_t ret = discover_driver_fn(driver);
+ 
+     if (ret != HSA_STATUS_SUCCESS) continue;
+ 
++    if (is_virtio && driver->kernel_driver_type_ == core::DriverType::KFD) continue;
++
+     core::Runtime::runtime_singleton_->RegisterDriver(std::move(driver));
+   }
+ }
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+index ff82ca70b8..da56e85f95 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+@@ -1000,8 +1000,13 @@ Runtime::AddressHandle* Runtime::VMemoryFindReservedAddressHandle(const void* va
+   auto reservedAddressIt = reserved_address_map_.upper_bound(va);
+   if (reservedAddressIt != reserved_address_map_.begin()) {
+     reservedAddressIt--;
++    /* Half-open range [first, first+size): `first+size` is one-past-the-end and does
++     * NOT belong to the reservation. The previous inclusive `<=` false-matched a pointer
++     * allocated immediately after a reserved range (base == reserved_end), which made
++     * PtrInfo mis-report a pool allocation as RESERVED_ADDR -> degenerate owning block ->
++     * spurious kernarg map failure / hipStreamCreate OOM. */
+     if ((reservedAddressIt->first <= va) &&
+-        ((reinterpret_cast<const uint8_t*>(va)) <=
++        ((reinterpret_cast<const uint8_t*>(va)) <
+          (reinterpret_cast<const uint8_t*>(reservedAddressIt->first) +
+           reservedAddressIt->second.size))) {
+       return &(reservedAddressIt->second);
+@@ -4067,13 +4072,21 @@ hsa_status_t Runtime::MappedHandleAllowedAgent::EnableAccess(hsa_access_permissi
+     if (core::Runtime::runtime_singleton_->thunkLoader()->IsWslDxg()) return HSA_STATUS_ERROR;
+ 
+     auto agentOwner = mappedHandle->mem_handle->agentOwner();
+-    int mmap_fd = -1;
+-    /* Do not check the return value of GetDeviceFd. We do not need mmap_fd so it is valid for mmap_fd to be -1*/
+-    agentOwner->driver().GetDeviceFd(agentOwner->node_id(), &mmap_fd);
++#ifdef HSAKMT_VIRTIO_ENABLED
++    // virtio-gpu guests cannot mmap the host BO into the guest address space
++    // without guest-kernel support, so skip the CPU-side mapping for the virtio
++    // driver. GPU-side access is still established via the driver Map() path below.
++    if (agentOwner->driver().kernel_driver_type_ != core::DriverType::KFD_VIRTIO)
++#endif
++    {
++      int mmap_fd = -1;
++      /* Do not check the return value of GetDeviceFd. We do not need mmap_fd so it is valid for mmap_fd to be -1*/
++      agentOwner->driver().GetDeviceFd(agentOwner->node_id(), &mmap_fd);
+ 
+-    if (!rocr::os::MapMemory(va, size, PermissionsToMemProt(perms), mmap_fd,
+-                             mappedHandle->mem_handle->driver_handle.mmap_offset)) {
+-      return HSA_STATUS_ERROR;
++      if (!rocr::os::MapMemory(va, size, PermissionsToMemProt(perms), mmap_fd,
++                               mappedHandle->mem_handle->driver_handle.mmap_offset)) {
++        return HSA_STATUS_ERROR;
++      }
+     }
+   } else {
+     hsa_status_t status = targetAgent->driver().Map(driver_handle, va, mappedHandle->offset, size, perms, targetAgent->node_id());
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/thunk_loader.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/thunk_loader.cpp
+index 2b1dd2d804..c72b8f636f 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/thunk_loader.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/thunk_loader.cpp
+@@ -42,6 +42,9 @@
+ 
+ #include "core/inc/thunk_loader.h"
+ #include "core/inc/runtime.h"
++#ifdef HSAKMT_VIRTIO_ENABLED
++#include "hsakmt/hsakmt_virtio.h"
++#endif
+ 
+ #include <core/util/os.h>
+ #include <iostream>
+@@ -55,6 +58,7 @@ namespace core {
+ 
+   std::string ThunkLoader::whoami() {
+     is_dtif_ = is_win_dxg_ = is_wsl_dxg_ = false;
++    is_virtio_ = false;
+     if (core::Runtime::runtime_singleton_->flag().enable_dtif()) {
+       is_dtif_ = true;
+ #if defined(_WIN32)
+@@ -77,6 +81,24 @@ namespace core {
+     is_win_dxg_ = true;
+ #endif
+ 
++#if defined(HSAKMT_VIRTIO_ENABLED) && defined(__linux__)
++    {
++      const std::string vv = core::Runtime::runtime_singleton_->flag().enable_virtio();
++      if (vv == "1") {
++        is_virtio_ = true;                 // force virtio
++      } else if (vv == "0") {
++        is_virtio_ = false;                // force native KFD
++      } else {
++        // Auto: KFD has priority over virtio. Use virtio only when the
++        // native /dev/kfd node is unavailable (e.g. virtio-gpu guest).
++        int kfd_fd = open("/dev/kfd", O_RDWR);
++        if (kfd_fd >= 0) { close(kfd_fd); is_virtio_ = false; }
++        else { is_virtio_ = true; }
++      }
++      if (is_virtio_) debug_print("ThunkLoader: virtio-gpu backend selected.\n");
++    }
++#endif
++
+     return "";
+   }
+ 
+@@ -599,6 +621,96 @@ LOAD_ERROR:
+       DRM_PFN(amdgpu_bo_set_metadata) = (DRM_DEF(amdgpu_bo_set_metadata)*)(&amdgpu_bo_set_metadata);
+ #if defined(__linux__)
+       DRM_PFN(drmCommandWriteRead) = (DRM_DEF(drmCommandWriteRead)*)(&drmCommandWriteRead);
++#ifdef HSAKMT_VIRTIO_ENABLED
++      // gpk: when the virtio-gpu backend is selected, override the
++      // process-wide thunk table with the virtio (vhsaKmt*) implementations.
++      // Functions with no virtio equivalent stay bound to the native
++      // &hsaKmt* above (harmless on a guest without /dev/kfd). This routes
++      // every HSAKMT_CALL to virtio and removes the per-call #ifdef WA.
++      if (is_virtio_) {
++        HSAKMT_PFN(hsaKmtAcquireSystemProperties) = (HSAKMT_DEF(hsaKmtAcquireSystemProperties)*)(&vhsaKmtAcquireSystemProperties);
++        HSAKMT_PFN(hsaKmtAisReadWriteFile) = (HSAKMT_DEF(hsaKmtAisReadWriteFile)*)(&vhsaKmtAisReadWriteFile);
++        HSAKMT_PFN(hsaKmtAllocMemory) = (HSAKMT_DEF(hsaKmtAllocMemory)*)(&vhsaKmtAllocMemory);
++        HSAKMT_PFN(hsaKmtAllocMemoryAlign) = (HSAKMT_DEF(hsaKmtAllocMemoryAlign)*)(&vhsaKmtAllocMemoryAlign);
++        HSAKMT_PFN(hsaKmtAllocQueueGWS) = (HSAKMT_DEF(hsaKmtAllocQueueGWS)*)(&vhsaKmtAllocQueueGWS);
++        HSAKMT_PFN(hsaKmtAvailableMemory) = (HSAKMT_DEF(hsaKmtAvailableMemory)*)(&vhsaKmtAvailableMemory);
++        HSAKMT_PFN(hsaKmtCloseKFD) = (HSAKMT_DEF(hsaKmtCloseKFD)*)(&vhsaKmtCloseKFD);
++        HSAKMT_PFN(hsaKmtCreateEvent) = (HSAKMT_DEF(hsaKmtCreateEvent)*)(&vhsaKmtCreateEvent);
++        HSAKMT_PFN(hsaKmtCreateQueue) = (HSAKMT_DEF(hsaKmtCreateQueue)*)(&vhsaKmtCreateQueue);
++        HSAKMT_PFN(hsaKmtCreateQueueExt) = (HSAKMT_DEF(hsaKmtCreateQueueExt)*)(&vhsaKmtCreateQueueExt);
++        HSAKMT_PFN(hsaKmtCreateQueueV2) = (HSAKMT_DEF(hsaKmtCreateQueueV2)*)(&vhsaKmtCreateQueueV2);
++        HSAKMT_PFN(hsaKmtDeregisterMemory) = (HSAKMT_DEF(hsaKmtDeregisterMemory)*)(&vhsaKmtDeregisterMemory);
++        HSAKMT_PFN(hsaKmtDestroyEvent) = (HSAKMT_DEF(hsaKmtDestroyEvent)*)(&vhsaKmtDestroyEvent);
++        HSAKMT_PFN(hsaKmtDestroyQueue) = (HSAKMT_DEF(hsaKmtDestroyQueue)*)(&vhsaKmtDestroyQueue);
++        HSAKMT_PFN(hsaKmtExportDMABufHandle) = (HSAKMT_DEF(hsaKmtExportDMABufHandle)*)(&vhsaKmtExportDMABufHandle);
++        HSAKMT_PFN(hsaKmtFreeMemory) = (HSAKMT_DEF(hsaKmtFreeMemory)*)(&vhsaKmtFreeMemory);
++        HSAKMT_PFN(hsaKmtGetAMDGPUDeviceHandle) = (HSAKMT_DEF(hsaKmtGetAMDGPUDeviceHandle)*)(&vhsaKmtGetAMDGPUDeviceHandle);
++        HSAKMT_PFN(hsaKmtGetClockCounters) = (HSAKMT_DEF(hsaKmtGetClockCounters)*)(&vhsaKmtGetClockCounters);
++        HSAKMT_PFN(hsaKmtGetNodeCacheProperties) = (HSAKMT_DEF(hsaKmtGetNodeCacheProperties)*)(&vhsaKmtGetNodeCacheProperties);
++        HSAKMT_PFN(hsaKmtGetNodeIoLinkProperties) = (HSAKMT_DEF(hsaKmtGetNodeIoLinkProperties)*)(&vhsaKmtGetNodeIoLinkProperties);
++        HSAKMT_PFN(hsaKmtGetNodeMemoryProperties) = (HSAKMT_DEF(hsaKmtGetNodeMemoryProperties)*)(&vhsaKmtGetNodeMemoryProperties);
++        HSAKMT_PFN(hsaKmtGetNodeProperties) = (HSAKMT_DEF(hsaKmtGetNodeProperties)*)(&vhsaKmtGetNodeProperties);
++        HSAKMT_PFN(hsaKmtGetQueueInfo) = (HSAKMT_DEF(hsaKmtGetQueueInfo)*)(&vhsaKmtGetQueueInfo);
++        HSAKMT_PFN(hsaKmtGetRuntimeCapabilities) = (HSAKMT_DEF(hsaKmtGetRuntimeCapabilities)*)(&vhsaKmtGetRuntimeCapabilities);
++        HSAKMT_PFN(hsaKmtGetTileConfig) = (HSAKMT_DEF(hsaKmtGetTileConfig)*)(&vhsaKmtGetTileConfig);
++        HSAKMT_PFN(hsaKmtGetVersion) = (HSAKMT_DEF(hsaKmtGetVersion)*)(&vhsaKmtGetVersion);
++        HSAKMT_PFN(hsaKmtGetXNACKMode) = (HSAKMT_DEF(hsaKmtGetXNACKMode)*)(&vhsaKmtGetXNACKMode);
++        HSAKMT_PFN(hsaKmtMapGraphicHandle) = (HSAKMT_DEF(hsaKmtMapGraphicHandle)*)(&vhsaKmtMapGraphicHandle);
++        HSAKMT_PFN(hsaKmtMapMemoryToGPU) = (HSAKMT_DEF(hsaKmtMapMemoryToGPU)*)(&vhsaKmtMapMemoryToGPU);
++        HSAKMT_PFN(hsaKmtMapMemoryToGPUNodes) = (HSAKMT_DEF(hsaKmtMapMemoryToGPUNodes)*)(&vhsaKmtMapMemoryToGPUNodes);
++        HSAKMT_PFN(hsaKmtModelEnabled) = (HSAKMT_DEF(hsaKmtModelEnabled)*)(&vhsaKmtModelEnabled);
++        HSAKMT_PFN(hsaKmtOpenKFD) = (HSAKMT_DEF(hsaKmtOpenKFD)*)(&vhsaKmtOpenKFD);
++        HSAKMT_PFN(hsaKmtOpenSMI) = (HSAKMT_DEF(hsaKmtOpenSMI)*)(&vhsaKmtOpenSMI);
++        HSAKMT_PFN(hsaKmtProcessVMRead) = (HSAKMT_DEF(hsaKmtProcessVMRead)*)(&vhsaKmtProcessVMRead);
++        HSAKMT_PFN(hsaKmtProcessVMWrite) = (HSAKMT_DEF(hsaKmtProcessVMWrite)*)(&vhsaKmtProcessVMWrite);
++        HSAKMT_PFN(hsaKmtQueryEventState) = (HSAKMT_DEF(hsaKmtQueryEventState)*)(&vhsaKmtQueryEventState);
++        HSAKMT_PFN(hsaKmtQueryPointerInfo) = (HSAKMT_DEF(hsaKmtQueryPointerInfo)*)(&vhsaKmtQueryPointerInfo);
++        HSAKMT_PFN(hsaKmtRegisterGraphicsHandleToNodes) = (HSAKMT_DEF(hsaKmtRegisterGraphicsHandleToNodes)*)(&vhsaKmtRegisterGraphicsHandleToNodes);
++        HSAKMT_PFN(hsaKmtRegisterGraphicsHandleToNodesExt) = (HSAKMT_DEF(hsaKmtRegisterGraphicsHandleToNodesExt)*)(&vhsaKmtRegisterGraphicsHandleToNodesExt);
++        HSAKMT_PFN(hsaKmtRegisterMemory) = (HSAKMT_DEF(hsaKmtRegisterMemory)*)(&vhsaKmtRegisterMemory);
++        HSAKMT_PFN(hsaKmtRegisterMemoryToNodes) = (HSAKMT_DEF(hsaKmtRegisterMemoryToNodes)*)(&vhsaKmtRegisterMemoryToNodes);
++        HSAKMT_PFN(hsaKmtRegisterMemoryWithFlags) = (HSAKMT_DEF(hsaKmtRegisterMemoryWithFlags)*)(&vhsaKmtRegisterMemoryWithFlags);
++        HSAKMT_PFN(hsaKmtRegisterSharedHandle) = (HSAKMT_DEF(hsaKmtRegisterSharedHandle)*)(&vhsaKmtRegisterSharedHandle);
++        HSAKMT_PFN(hsaKmtRegisterSharedHandleToNodes) = (HSAKMT_DEF(hsaKmtRegisterSharedHandleToNodes)*)(&vhsaKmtRegisterSharedHandleToNodes);
++        HSAKMT_PFN(hsaKmtReleaseSystemProperties) = (HSAKMT_DEF(hsaKmtReleaseSystemProperties)*)(&vhsaKmtReleaseSystemProperties);
++        HSAKMT_PFN(hsaKmtReplaceAsanHeaderPage) = (HSAKMT_DEF(hsaKmtReplaceAsanHeaderPage)*)(&vhsaKmtReplaceAsanHeaderPage);
++        HSAKMT_PFN(hsaKmtResetEvent) = (HSAKMT_DEF(hsaKmtResetEvent)*)(&vhsaKmtResetEvent);
++        HSAKMT_PFN(hsaKmtReturnAsanHeaderPage) = (HSAKMT_DEF(hsaKmtReturnAsanHeaderPage)*)(&vhsaKmtReturnAsanHeaderPage);
++        HSAKMT_PFN(hsaKmtRuntimeDisable) = (HSAKMT_DEF(hsaKmtRuntimeDisable)*)(&vhsaKmtRuntimeDisable);
++        HSAKMT_PFN(hsaKmtRuntimeEnable) = (HSAKMT_DEF(hsaKmtRuntimeEnable)*)(&vhsaKmtRuntimeEnable);
++        HSAKMT_PFN(hsaKmtSPMAcquire) = (HSAKMT_DEF(hsaKmtSPMAcquire)*)(&vhsaKmtSPMAcquire);
++        HSAKMT_PFN(hsaKmtSPMRelease) = (HSAKMT_DEF(hsaKmtSPMRelease)*)(&vhsaKmtSPMRelease);
++        HSAKMT_PFN(hsaKmtSPMSetDestBuffer) = (HSAKMT_DEF(hsaKmtSPMSetDestBuffer)*)(&vhsaKmtSPMSetDestBuffer);
++        HSAKMT_PFN(hsaKmtSVMGetAttr) = (HSAKMT_DEF(hsaKmtSVMGetAttr)*)(&vhsaKmtSVMGetAttr);
++        HSAKMT_PFN(hsaKmtSVMSetAttr) = (HSAKMT_DEF(hsaKmtSVMSetAttr)*)(&vhsaKmtSVMSetAttr);
++        HSAKMT_PFN(hsaKmtSetEvent) = (HSAKMT_DEF(hsaKmtSetEvent)*)(&vhsaKmtSetEvent);
++        HSAKMT_PFN(hsaKmtSetMemoryPolicy) = (HSAKMT_DEF(hsaKmtSetMemoryPolicy)*)(&vhsaKmtSetMemoryPolicy);
++        HSAKMT_PFN(hsaKmtSetMemoryUserData) = (HSAKMT_DEF(hsaKmtSetMemoryUserData)*)(&vhsaKmtSetMemoryUserData);
++        HSAKMT_PFN(hsaKmtSetQueueCUMask) = (HSAKMT_DEF(hsaKmtSetQueueCUMask)*)(&vhsaKmtSetQueueCUMask);
++        HSAKMT_PFN(hsaKmtSetTrapHandler) = (HSAKMT_DEF(hsaKmtSetTrapHandler)*)(&vhsaKmtSetTrapHandler);
++        HSAKMT_PFN(hsaKmtSetXNACKMode) = (HSAKMT_DEF(hsaKmtSetXNACKMode)*)(&vhsaKmtSetXNACKMode);
++        HSAKMT_PFN(hsaKmtShareMemory) = (HSAKMT_DEF(hsaKmtShareMemory)*)(&vhsaKmtShareMemory);
++        HSAKMT_PFN(hsaKmtUnmapGraphicHandle) = (HSAKMT_DEF(hsaKmtUnmapGraphicHandle)*)(&vhsaKmtUnmapGraphicHandle);
++        HSAKMT_PFN(hsaKmtUnmapMemoryToGPU) = (HSAKMT_DEF(hsaKmtUnmapMemoryToGPU)*)(&vhsaKmtUnmapMemoryToGPU);
++        HSAKMT_PFN(hsaKmtUpdateQueue) = (HSAKMT_DEF(hsaKmtUpdateQueue)*)(&vhsaKmtUpdateQueue);
++        HSAKMT_PFN(hsaKmtWaitOnEvent) = (HSAKMT_DEF(hsaKmtWaitOnEvent)*)(&vhsaKmtWaitOnEvent);
++        HSAKMT_PFN(hsaKmtWaitOnEvent_Ext) = (HSAKMT_DEF(hsaKmtWaitOnEvent_Ext)*)(&vhsaKmtWaitOnEvent_Ext);
++        HSAKMT_PFN(hsaKmtWaitOnMultipleEvents) = (HSAKMT_DEF(hsaKmtWaitOnMultipleEvents)*)(&vhsaKmtWaitOnMultipleEvents);
++        HSAKMT_PFN(hsaKmtWaitOnMultipleEvents_Ext) = (HSAKMT_DEF(hsaKmtWaitOnMultipleEvents_Ext)*)(&vhsaKmtWaitOnMultipleEvents_Ext);
++
++        DRM_PFN(amdgpu_device_initialize) = (DRM_DEF(amdgpu_device_initialize)*)(&vamdgpu_device_initialize);
++        DRM_PFN(amdgpu_device_deinitialize) = (DRM_DEF(amdgpu_device_deinitialize)*)(&vamdgpu_device_deinitialize);
++        DRM_PFN(amdgpu_query_gpu_info) = (DRM_DEF(amdgpu_query_gpu_info)*)(&vamdgpu_query_gpu_info);
++        DRM_PFN(amdgpu_bo_cpu_map) = (DRM_DEF(amdgpu_bo_cpu_map)*)(&vamdgpu_bo_cpu_map);
++        DRM_PFN(amdgpu_bo_free) = (DRM_DEF(amdgpu_bo_free)*)(&vamdgpu_bo_free);
++        DRM_PFN(amdgpu_bo_export) = (DRM_DEF(amdgpu_bo_export)*)(&vamdgpu_bo_export);
++        DRM_PFN(amdgpu_bo_import) = (DRM_DEF(amdgpu_bo_import)*)(&vamdgpu_bo_import);
++        DRM_PFN(amdgpu_bo_va_op) = (DRM_DEF(amdgpu_bo_va_op)*)(&vamdgpu_bo_va_op);
++        DRM_PFN(amdgpu_bo_query_info) = (DRM_DEF(amdgpu_bo_query_info)*)(&vamdgpu_bo_query_info);
++        DRM_PFN(amdgpu_bo_set_metadata) = (DRM_DEF(amdgpu_bo_set_metadata)*)(&vamdgpu_bo_set_metadata);
++        DRM_PFN(drmCommandWriteRead) = (DRM_DEF(drmCommandWriteRead)*)(&vdrmCommandWriteRead);
++      }
++#endif
+ #endif
+     }
+   }
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
+index e18a6d1267..3efdd0915f 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h
+@@ -317,6 +317,10 @@ class Flag {
+     var = os::GetEnvVar("HSA_ENABLE_DXG_DETECTION");
+     enable_dxg_detection_ = (var == "0") ? false : true;
+ 
++    // gpk: HSA_ENABLE_VIRTIO tri-state. ""=auto (KFD has priority: use
++    // virtio only when /dev/kfd is absent), "1"=force virtio, "0"=force KFD.
++    enable_virtio_ = os::GetEnvVar("HSA_ENABLE_VIRTIO");
++
+     var = os::GetEnvVar("HSA_CO_DMACOPY_SIZE");
+     co_dmacopy_size_ = var.empty() ? 1024*1024 : atoi(var.c_str());
+ 
+@@ -490,6 +494,7 @@ class Flag {
+   bool enable_dtif() const { return enable_dtif_; }
+ 
+   bool enable_dxg_detection() const { return enable_dxg_detection_; }
++  const std::string& enable_virtio() const { return enable_virtio_; }
+ 
+   SDMA_OVERRIDE sdma_linear_b2b() const { return sdma_linear_b2b_; }
+ 
+@@ -572,6 +577,7 @@ class Flag {
+   bool enable_3d_swizzle_ = false;
+   bool enable_dtif_;
+   bool enable_dxg_detection_;
++  std::string enable_virtio_;
+   SDMA_OVERRIDE sdma_linear_b2b_ = SDMA_DEFAULT;
+ 
+   SDMA_OVERRIDE enable_sdma_;

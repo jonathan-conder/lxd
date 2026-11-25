@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Honglei Huang <honghuan@amd.com>
+Date: Fri, 6 Nov 2026 16:26:22 +0800
+Subject: [PATCH 1/4] drm/virtio: add VIRTIO_GPU_CAPSET_ROCM capability
+
+Add a new GPU capability set VIRTIO_GPU_CAPSET_ROCM to support ROCm
+compute workloads in virtualized environments.
+
+ROCm (Radeon Open Compute) is AMD's open-source software platform for
+GPU compute and HPC workloads.
+
+ID 7 is already used by the OpenCL capset (VIRCL), and gfxstream's
+rutabaga_gfx has already claimed IDs 7-9 ahead of any spec or kernel
+header update, so ROCm uses ID 10 to avoid a further collision. A
+matching virtio-gpu specification change is in progress to register this
+assignment.
+
+Also add the matching VIRTGPU_DRM_CAPSET_ROCM alias in virtgpu_drm.h for
+consistency with the other capability sets exposed through
+DRM_IOCTL_VIRTGPU_GET_CAPS.
+
+Signed-off-by: Honglei Huang <honghuan@amd.com>
+
+diff --git a/include/uapi/drm/virtgpu_drm.h b/include/uapi/drm/virtgpu_drm.h
+index 9debb320c..2e740fb0b 100644
+--- a/include/uapi/drm/virtgpu_drm.h
++++ b/include/uapi/drm/virtgpu_drm.h
+@@ -169,6 +169,7 @@ struct drm_virtgpu_3d_wait {
+ #define VIRTGPU_DRM_CAPSET_VENUS 4
+ #define VIRTGPU_DRM_CAPSET_CROSS_DOMAIN 5
+ #define VIRTGPU_DRM_CAPSET_DRM 6
++#define VIRTGPU_DRM_CAPSET_ROCM 10
+ struct drm_virtgpu_get_caps {
+ 	__u32 cap_set_id;
+ 	__u32 cap_set_ver;
+diff --git a/include/uapi/linux/virtio_gpu.h b/include/uapi/linux/virtio_gpu.h
+index be109777d..e869d17c5 100644
+--- a/include/uapi/linux/virtio_gpu.h
++++ b/include/uapi/linux/virtio_gpu.h
+@@ -313,6 +313,7 @@ struct virtio_gpu_cmd_submit {
+ #define VIRTIO_GPU_CAPSET_VENUS 4
+ #define VIRTIO_GPU_CAPSET_CROSS_DOMAIN 5
+ #define VIRTIO_GPU_CAPSET_DRM 6
++#define VIRTIO_GPU_CAPSET_ROCM 10
+ 
+ /* VIRTIO_GPU_CMD_GET_CAPSET_INFO */
+ struct virtio_gpu_get_capset_info {
+
+base-commit: d1fe0e9bd1945965e163ff1c3a3aa2b9535fe13a
+-- 
+2.43.0
+

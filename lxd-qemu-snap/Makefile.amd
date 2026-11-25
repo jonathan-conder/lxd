@@ -1,0 +1,90 @@
+BUILD_DIR := build
+SOURCE_DIR := $(BUILD_DIR)/kernel
+SOURCE_VERSION := 7.0.0-44.44
+SOURCE_REPOSITORY := https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute
+SOURCE_TAG := Ubuntu-$(SOURCE_VERSION)
+PATCH_DIR := patches/ubuntu-rocm-guest
+NPROC := $(shell nproc)
+ARCH := $(shell dpkg --print-architecture)
+# The rocm-virtio flavour is added by the last patch in PATCH_DIR.
+FLAVOUR := rocm-virtio
+KERNEL_RELEASE := 7.0.0-44-$(FLAVOUR)
+KERNEL_PACKAGES := $(foreach p,linux-image-unsigned linux-modules,$(BUILD_DIR)/$(p)-$(KERNEL_RELEASE)_$(SOURCE_VERSION)_$(ARCH).deb)
+
+ROCR_SOURCE_DIR := $(BUILD_DIR)/rocm-systems
+ROCR_REPOSITORY := https://github.com/ROCm/rocm-systems.git
+ROCR_COMMIT := 2b22ab0195cc1461cd9abf3b969e9dd7c10af350
+# projects/rocr-runtime part of rocm-systems-source.patch from docker.io/rocmvirtio/rocm-virtio.
+ROCR_PATCH := patches/rocr-runtime-virtio.patch
+ROCR_BUILD_DIR := $(BUILD_DIR)/rocr
+ROCR_LIBRARY := $(BUILD_DIR)/libhsa-runtime64.so.1
+# gfx1250 shaders need LLVM 22, but Ubuntu only packages device libraries for
+# LLVM 21. LLVM 22 reads the older bitcode used by the image blit kernels.
+LLVM_DIR := /usr/lib/llvm-22
+DEVICE_LIB_PATH := /usr/lib/llvm-21/lib/clang/21/amdgcn/bitcode
+
+.PHONY: kernel kernel-source rocr rocr-source clean
+
+kernel: $(KERNEL_PACKAGES)
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+kernel-source:
+	@if ! git -C $(SOURCE_DIR) remote get-url origin 2>/dev/null | grep -qx $(SOURCE_REPOSITORY); then \
+		rm -rf $(SOURCE_DIR); \
+		git clone --depth=1 --branch $(SOURCE_TAG) $(SOURCE_REPOSITORY) $(SOURCE_DIR); \
+	fi
+
+$(SOURCE_DIR)/.amd-patches-applied: $(PATCH_DIR)/*.patch | kernel-source
+	git -C $(SOURCE_DIR) fetch --quiet --depth=1 origin tag $(SOURCE_TAG)
+	git -C $(SOURCE_DIR) reset --hard --quiet FETCH_HEAD
+	git -C $(SOURCE_DIR) clean -fdx --quiet
+	git -C $(SOURCE_DIR) -c user.name=builder -c user.email=builder@localhost am $(abspath $(PATCH_DIR))/*.patch
+	cd $(SOURCE_DIR) && env -u MAKEFLAGS -u MAKELEVEL fakeroot debian/rules clean
+	touch $@
+
+$(SOURCE_DIR)/debian/stamps/stamp-prepare-$(FLAVOUR): $(SOURCE_DIR)/.amd-patches-applied
+	cd $(SOURCE_DIR) && env -u MAKEFLAGS -u MAKELEVEL make -f debian/rules prepare-$(FLAVOUR)
+
+$(SOURCE_DIR)/debian/build/build-$(FLAVOUR)/.config: $(SOURCE_DIR)/debian/stamps/stamp-prepare-$(FLAVOUR)
+	$(SOURCE_DIR)/scripts/config --file $@ \
+		--set-str SYSTEM_TRUSTED_KEYS "" \
+		--set-str SYSTEM_REVOCATION_KEYS "" \
+		--disable WERROR
+
+$(KERNEL_PACKAGES) &: $(SOURCE_DIR)/.amd-patches-applied $(SOURCE_DIR)/debian/build/build-$(FLAVOUR)/.config
+	cd $(SOURCE_DIR) && env -u MAKEFLAGS -u MAKELEVEL fakeroot debian/rules CONCURRENCY_LEVEL=$(NPROC) binary-$(FLAVOUR)
+
+rocr: $(ROCR_LIBRARY)
+
+rocr-source:
+	@if [ "$$(git -C $(ROCR_SOURCE_DIR) rev-parse HEAD 2>/dev/null)" != $(ROCR_COMMIT) ]; then \
+		rm -rf $(ROCR_SOURCE_DIR); \
+		git init --quiet $(ROCR_SOURCE_DIR); \
+		git -C $(ROCR_SOURCE_DIR) remote add origin $(ROCR_REPOSITORY); \
+		git -C $(ROCR_SOURCE_DIR) sparse-checkout set projects/rocr-runtime; \
+		git -C $(ROCR_SOURCE_DIR) fetch --depth=1 --filter=blob:none origin $(ROCR_COMMIT); \
+		git -C $(ROCR_SOURCE_DIR) checkout --quiet FETCH_HEAD; \
+	fi
+
+# The patch also touches CLR's OpenCL runtime, which PyTorch does not need.
+$(ROCR_SOURCE_DIR)/.amd-patches-applied: $(ROCR_PATCH) | rocr-source
+	git -C $(ROCR_SOURCE_DIR) checkout --quiet --force $(ROCR_COMMIT)
+	git -C $(ROCR_SOURCE_DIR) clean -fdx --quiet
+	git -C $(ROCR_SOURCE_DIR) apply $(abspath $(ROCR_PATCH))
+	touch $@
+
+$(ROCR_BUILD_DIR)/build.ninja: $(ROCR_SOURCE_DIR)/.amd-patches-applied
+	cmake -S $(ROCR_SOURCE_DIR)/projects/rocr-runtime -B $(ROCR_BUILD_DIR) -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_PREFIX_PATH=$(LLVM_DIR) \
+		-DBUILD_SHARED_LIBS=ON \
+		-DBUILD_THUNK_VIRTIO=ON
+
+$(ROCR_LIBRARY): $(ROCR_BUILD_DIR)/build.ninja
+	HIP_DEVICE_LIB_PATH=$(DEVICE_LIB_PATH) ninja -C $(ROCR_BUILD_DIR) hsa-runtime64
+	cp -L $(ROCR_BUILD_DIR)/rocr/lib/libhsa-runtime64.so.1 $@
+
+clean:
+	rm -rf $(BUILD_DIR)

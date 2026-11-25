@@ -1,7 +1,7 @@
 name: qemu-for-lxd
-base: core24
+base: core26
 assumes:
-  - snapd2.63
+  - snapd2.75
 version: '1'
 grade: devel
 summary: External Qemu for LXD
@@ -22,15 +22,373 @@ slots:
       - $SNAP/external/qemu
 
 parts:
-  #
-  # This step is extremely important, as it ensures that no mesa libs will
-  # be provided with this snap to prevent any possible version mistmatches
-  # between this snap and mesa-2604 snap.
-  # If you the error like:
-  # DRI driver not from this Mesa build ('24.0.5-1ubuntu1' vs '24.0.9-0ubuntu0.1')
-  # this is a clear sign that you likely ship some mesa library along with your qemu-for-lxd
-  # snap and it has a version conflict with what you have in gpu-2604 interface snap.
-  #
+  python-runtime:
+    plugin: nil
+    stage-packages:
+      - python3.14-minimal
+      - libpython3.14-stdlib
+    organize:
+      usr/bin/: external/qemu/bin/
+      usr/lib/: external/qemu/lib/
+    prime:
+      - external/qemu/bin/python3.14
+      - external/qemu/lib/python3.14
+      # Exclude unused bits
+      - -external/qemu/lib/python3.14/lib-dynload/_remote_debugging.*.so
+      - -external/qemu/lib/python3.14/lib-dynload/_test*.so
+      - -external/qemu/lib/python3.14/test/
+      - -external/qemu/lib/python3.14/unittest/
+
+  libatomic:
+    plugin: nil
+    override-stage: |-
+      case "${CRAFT_ARCH_BUILD_FOR}" in
+          riscv64|s390x) ;;
+          *) exit 0 ;;
+      esac
+      craftctl default
+    override-prime: |-
+      case "${CRAFT_ARCH_BUILD_FOR}" in
+          riscv64|s390x) ;;
+          *) exit 0 ;;
+      esac
+      craftctl default
+    stage-packages:
+      - to riscv64:
+        - libatomic1
+      - to s390x:
+        - libatomic1
+    organize:
+      usr/lib/: external/qemu/lib/
+    prime:
+      # XXX: libatomic.so is needed by Ceph/QEMU on s390x and riscv64.
+      - external/qemu/lib/*/libatomic.so*
+
+  spice-server:
+    after:
+      - python-runtime
+    source: https://git.launchpad.net/ubuntu/+source/spice
+    source-commit: 8c6cce7e0f8543063f2418051635efa52302fd47 # import/0.16.0-1
+    source-depth: 1
+    source-type: git
+    # XXX: needed for snapcraft 8.x only
+    build-environment:
+      - PATH: "/usr/bin:${PATH}" # ensure python3 is found in PATH
+    plugin: meson
+    meson-parameters:
+      - --prefix=/
+      - -Dgstreamer=no
+      - -Dmanual=false
+      - -Dlz4=false
+      - -Dsasl=false
+      - -Dopus=disabled
+      - -Dsmartcard=disabled
+      - -Dtests=false
+    build-packages:
+      - to armhf: []
+      - else:
+        - libspice-protocol-dev
+        - libjpeg-turbo8-dev
+        - libssl-dev
+        - python3-pyparsing
+        - python3-six
+        - meson
+        - ninja-build
+    stage-packages:
+      - to armhf: []
+      - else:
+        - libjpeg-turbo8
+        - libpixman-1-0
+    override-stage: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      craftctl default
+    override-prime: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      craftctl default
+    override-pull: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      craftctl default
+    override-build: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+
+      # Apply patches from Ubuntu sources.
+      cd ../src
+      QUILT_PATCHES=debian/patches quilt push -a || test -z "$(QUILT_PATCHES=debian/patches quilt unapplied)"
+      cd ../build
+
+      craftctl default
+    organize:
+      usr/lib: external/qemu/lib/
+    prime:
+      - external/qemu/lib/*/libjpeg*so*
+      - external/qemu/lib/*/libspice-server*so*
+      - external/qemu/lib/*/libpixman*so*
+
+  hsakmt:
+    source: https://github.com/ROCm/rocm-systems.git
+    source-commit: 2b22ab0195cc1461cd9abf3b969e9dd7c10af350
+    source-depth: 1
+    source-subdir: projects/rocr-runtime/libhsakmt
+    plugin: cmake
+    cmake-parameters:
+      - -DCMAKE_INSTALL_PREFIX=/external/qemu
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DHSAKMT_WERROR=OFF
+    build-packages:
+      - cmake
+      - libnuma-dev
+
+  virgl:
+    after:
+      - hsakmt
+    source: https://gitlab.freedesktop.org/honghuan/virglrenderer-honglei.git
+    source-commit: 754ae70367cbfb5da209c5c99c92f01343c5efff
+    source-depth: 1
+    plugin: meson
+    meson-parameters:
+      - --prefix=/external/qemu
+      - -Drocm-experimental=true
+      - -Drocm-hsakmt-static-archive=$CRAFT_STAGE/external/qemu/lib/libhsakmt.a
+    build-environment:
+      - PKG_CONFIG_PATH: $CRAFT_STAGE/external/qemu/lib/pkgconfig:$CRAFT_STAGE/external/qemu/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:${PKG_CONFIG_PATH:-}
+    build-packages:
+      - check
+      - meson
+      - python3-yaml
+      - libgbm-dev
+      - libdrm-dev
+      - libnuma-dev
+      - libvulkan-dev
+
+  rutabaga:
+    after:
+      - virgl
+    source: https://github.com/magma-gpu/rutabaga_gfx.git
+    source-commit: 87273a082c89aa8ef6a63e9fa8da7cc56eb573c6
+    source-depth: 1
+    plugin: meson
+    meson-parameters:
+      - --prefix=/external/qemu
+      - -Dffi=true
+      - -Dfeatures=virgl_renderer
+    build-environment:
+      - PKG_CONFIG_PATH: $CRAFT_STAGE/external/qemu/lib/pkgconfig:$CRAFT_STAGE/external/qemu/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:${PKG_CONFIG_PATH:-}
+    build-packages:
+      - bindgen
+      - meson
+      - rustc
+    override-pull: |-
+      craftctl default
+      git apply "${CRAFT_PROJECT_DIR}/patches/rutabaga-rocm.patch"
+    prime:
+      - external/qemu/lib/*/librutabaga_gfx_ffi.so*
+
+  qemu:
+    after:
+      - libatomic
+      - spice-server
+      - python-runtime
+      - virgl
+      - rutabaga
+    source: https://gitlab.com/qemu-project/qemu
+    source-commit: 73294d096cc591e122fde9e63db4739de6d84f2b
+    source-depth: 1
+    source-type: git
+    plugin: autotools
+    autotools-configure-parameters:
+      # XXX: needed for snapcraft 8.x only
+      - --python=/usr/bin/python3  # Force the use of the build host's Python
+      - --enable-opengl
+      - --enable-virglrenderer
+      - --enable-rutabaga-gfx
+      - --disable-auth-pam
+      - --disable-bochs
+      - --disable-brlapi
+      - --disable-cloop
+      - --disable-curl
+      - --disable-dmg
+      - --disable-docs
+      - --disable-fuse
+      - --disable-gnutls
+      - --disable-gtk
+      - --disable-guest-agent
+      - --disable-libiscsi
+      - --disable-libnfs
+      - --disable-libpmem
+      - --disable-libssh
+      - --disable-nettle
+      - --disable-oss
+      - --disable-parallels
+      - --disable-qed
+      - --disable-sdl
+      - --disable-slirp
+      - --disable-tcg  # TCG is not used (nor supported) at runtime
+      - --disable-user
+      - --disable-vde
+      - --disable-vdi
+      - --disable-vmnet
+      - --disable-vnc
+      - --disable-vvfat
+      - --disable-xen
+      - --disable-xkbcommon
+      - --enable-attr
+      - --enable-cap-ng
+      - --enable-kvm
+      - --enable-libusb
+      - --enable-usb-redir
+      - --enable-linux-aio
+      - --enable-linux-io-uring
+      - --enable-numa
+      - --enable-pie
+      - --enable-rbd
+      - --enable-seccomp
+      - --enable-spice
+      - --enable-system
+      - --enable-tools
+      - --enable-vhost-crypto
+      - --enable-vhost-kernel
+      - --enable-vhost-net
+      - --enable-vhost-user
+      - --firmwarepath=/snap/lxd/current/share/qemu/
+      - --localstatedir=/var/
+      - --disable-install-blobs # Ubuntu sources don't have the ROM blobs in them.
+    build-environment:
+      - ACLOCAL_PATH: /usr/share/aclocal
+      - PKG_CONFIG_PATH: $CRAFT_STAGE/external/qemu/lib/pkgconfig:$CRAFT_STAGE/external/qemu/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:$CRAFT_STAGE/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+    build-packages:
+      - to armhf: []
+      - else:
+        - b4
+        - bison
+        - bzip2
+        - flex
+        - pkg-config
+        - libaio-dev
+        - libcap-ng-dev
+        - libfdt-dev
+        - libepoxy-dev
+        - libglib2.0-dev
+        - libnuma-dev
+        - libpixman-1-dev
+        - libseccomp-dev
+        - liburing-dev
+        - libusb-1.0-0-dev
+        - libusbredirparser-dev
+        - meson
+        - quilt
+        - librbd-dev
+    stage-packages:
+      - to armhf: []
+      - else:
+        - genisoimage
+        - ipxe-qemu # This is needed due to --disable-install-blobs.
+        - libepoxy0
+        - libfdt1
+        - libmagic1t64
+        - libnuma1
+        - libpixman-1-0
+        - libusb-1.0-0
+        - libusbredirparser1t64
+        - liburing2
+        - opensbi # This is needed due to --disable-install-blobs.
+        - seabios # This is needed due to --disable-install-blobs.
+        - qemu-system-data # This is needed due to --disable-install-blobs.
+    override-stage: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      craftctl default
+    override-prime: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      craftctl default
+    override-pull: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      craftctl default
+      b4 am -o - 20261106082711.813336-1-honghuan@amd.com |
+        git -c user.name=Snapcraft -c user.email=snapcraft@localhost am
+      git apply "${CRAFT_PROJECT_DIR}/patches/qemu-rutabaga-rocm.patch"
+
+    override-build: |-
+      [ "${CRAFT_ARCH_BUILD_FOR}" = "armhf" ] && exit 0
+      set -ex
+      # If configure finds a `.git` dir, it enables -Werror (`--enable-werror` and Git submodules are validated).
+      # When building the deb on LP, this `.git` dir is not present because a tarball is used.
+      # The `-Werror` causes compilation failures on ppc64el so let's remove the `.git` dir to align with the deb behavior.
+      [ -d .git ] && rm -rf .git
+
+      # Mangle the configure a bit
+      case "${CRAFT_ARCH_BUILD_FOR}" in
+          amd64) QEMUARCH="x86_64" ;;
+          arm64) QEMUARCH="aarch64" ;;
+          ppc64el) QEMUARCH="ppc64" ;;
+          *) QEMUARCH="${CRAFT_ARCH_BUILD_FOR}" ;;
+      esac
+
+      sed -i "s/^unset target_list$/target_list=\"${QEMUARCH}-softmmu\"/" configure
+      sed -i 's#libseccomp_minver=".*#libseccomp_minver="0.0"#g' configure
+
+      # As of May 2026 QEMU for riscv64 does not support building with --disable-tcg
+      if [ "${QEMUARCH}" = "riscv64" ]; then
+          # `set -- "$@"`: preserve arguments passed to `configure` and append
+          # `--enable-tcg` at the end to override the previous `--disable-tcg`.
+          sed -i '1 a set -- "$@" --enable-tcg' configure
+      fi
+
+      # opensbi provides `fw_dynamic.bin` and `qemu-system-riscv` creates a
+      # symlink. Manually moving the binary into place avoids pulling the QEMU
+      # package just for the symlink.
+      if [ "${QEMUARCH}" = "riscv64" ]; then
+          mkdir -p "${CRAFT_PART_INSTALL}"/share/qemu/
+          mv "${CRAFT_PART_INSTALL}"/usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin "${CRAFT_PART_INSTALL}"/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+      fi
+
+      set +ex
+      craftctl default
+
+    organize:
+      usr/bin/: external/qemu/bin/
+      usr/lib/: external/qemu/lib/
+      usr/local/bin/: external/qemu/bin/
+      usr/local/lib/: external/qemu/lib/
+      usr/local/libexec/: external/qemu/bin/
+      usr/local/share/: external/qemu/share/
+      usr/share/qemu/efi-virtio.rom: external/qemu/share/qemu/
+      usr/share/qemu/kvmvapic.bin: external/qemu/share/qemu/
+      usr/share/qemu/s390-ccw.img: external/qemu/share/qemu/
+      usr/share/qemu/slof.bin: external/qemu/share/qemu/
+      usr/share/seabios/bios-256k.bin: external/qemu/share/qemu/
+      usr/share/seabios/vgabios-virtio.bin: external/qemu/share/qemu/
+    prime:
+      - external/qemu/bin/genisoimage*
+      - external/qemu/bin/mkisofs*
+      - external/qemu/bin/qemu-system-*
+      - external/qemu/bin/qemu-img*
+      - external/qemu/bin/qemu-nbd
+      - external/qemu/bin/qemu-storage-daemon
+      - external/qemu/lib/*/libatomic.so*
+      - external/qemu/lib/*/libepoxy.so*
+      - external/qemu/lib/*/libmagic*so*
+      - external/qemu/lib/*/libnuma*so*
+      - external/qemu/lib/*/libpixman*so*
+      - external/qemu/lib/*/liburing.so*
+      - external/qemu/lib/*/libusbredir*so*
+      - external/qemu/lib/*/libusb*so*
+      - to amd64:
+        - external/qemu/lib/*/libfdt*.so*
+        - external/qemu/share/qemu/bios-256k.bin
+        - external/qemu/share/qemu/efi-virtio.rom
+        - external/qemu/share/qemu/kvmvapic.bin
+        - external/qemu/share/qemu/vgabios-virtio.bin
+      - to arm64:
+        - external/qemu/lib/*/libfdt*.so*
+        - external/qemu/share/qemu/vgabios-virtio.bin
+      - to ppc64el:
+        - external/qemu/lib/*/libfdt*.so*
+        - external/qemu/share/qemu/slof.bin
+      - to riscv64:
+        - external/qemu/lib/*/libfdt*.so*
+        - external/qemu/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+      - to s390x:
+        - external/qemu/share/qemu/s390-ccw.img
+
   gpu-2604:
     after:
       - virgl
@@ -53,186 +411,3 @@ parts:
       rm -rf "${CRAFT_PRIME_OVERRIDE}/usr"
 
       set +ex
-
-  virgl:
-    source: https://gitlab.freedesktop.org/virgl/virglrenderer.git
-    source-tag: virglrenderer-1.2.0
-    source-depth: 1
-    plugin: meson
-    meson-parameters:
-      - --prefix=/external/qemu
-    build-packages:
-      - meson
-      - python3-yaml
-      - libgbm-dev
-      - libdrm-dev
-
-  qemu:
-    after:
-      - virgl
-    source: https://gitlab.com/qemu-project/qemu
-    source-commit: b2995afed254e4804611df52210067a4d5dbdf0b # v9.2.4
-    source-depth: 1
-    source-submodules: []
-    source-type: git
-    plugin: autotools
-    autotools-configure-parameters:
-      - --prefix=/external/qemu
-      - --enable-opengl
-      - --enable-virglrenderer
-      - --disable-smartcard
-# options from LXD snap:
-      - --disable-bochs
-      - --disable-cloop
-      - --disable-dmg
-      - --disable-docs
-      - --disable-guest-agent
-      - --disable-parallels
-      - --disable-qed
-      - --disable-slirp
-      - --disable-user
-      - --disable-vdi
-      - --disable-vnc
-      - --disable-xen
-      - --enable-attr
-      - --enable-cap-ng
-      - --enable-kvm
-      - --enable-libusb
-      - --enable-usb-redir
-      - --enable-linux-aio
-#      - --enable-linux-io-uring
-      - --enable-numa
-      - --enable-pie
-      - --enable-rbd
-      - --enable-seccomp
-      - --enable-spice
-      - --enable-system
-      - --enable-tcg
-      - --enable-tools
-      - --enable-vhost-crypto
-      - --enable-vhost-kernel
-      - --enable-vhost-net
-      - --enable-vhost-user
-      - --enable-virtfs
-      - --firmwarepath=/snap/lxd/current/share/qemu/
-      - --localstatedir=/var/
-    build-environment:
-      - ACLOCAL_PATH: /usr/share/aclocal
-      - PKG_CONFIG_PATH: $CRAFT_STAGE/external/qemu/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:$CRAFT_STAGE/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
-      - PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/snapcraft/current/bin/scriptlet-bin:$PATH
-      - LD_LIBRARY_PATH: $CRAFT_STAGE/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-    override-pull: |
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "ppc64le" ] && [ "$(uname -m)" != "s390x" ] && exit 0
-
-      craftctl default
-    override-build: |
-      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "ppc64le" ] && [ "$(uname -m)" != "s390x" ] && exit 0
-      set -ex
-      # Mangle the configure a bit
-      QEMUARCH="$(uname -m)"
-      [ "${QEMUARCH}" = "ppc64le" ] && QEMUARCH="ppc64"
-
-      sed -i "s/^unset target_list$/target_list=\"${QEMUARCH}-softmmu\"/" configure
-
-      set +ex
-      craftctl default
-    build-packages:
-      - bison
-      - flex
-      - gettext
-      - libaio-dev
-      - libbluetooth-dev
-      - libbrlapi-dev
-      - libbz2-dev
-      - libcap-dev
-      - libcap-ng-dev
-      - libcacard-dev
-      - libcurl4-gnutls-dev
-      - libepoxy-dev
-      - libfdt-dev
-      - libgtk-3-dev
-      - libglib2.0-dev
-      - libglusterfs-dev
-      - libibverbs-dev
-      - libiscsi-dev
-      - libjemalloc-dev
-      - libjpeg8-dev
-      - liblzo2-dev
-      - libncurses5-dev
-      - libnfs-dev
-      - libnuma-dev
-      - libpango1.0-dev
-      - libpixman-1-dev
-      - libpulse-dev
-      - librbd-dev
-      - librdmacm-dev
-      - libsasl2-dev
-      - libseccomp-dev
-      - libsdl2-dev
-      - libsdl2-image-dev
-      - libsnappy-dev
-      - libspice-protocol-dev
-      - libspice-server-dev
-      - libusb-1.0-0-dev
-      - libusbredirhost-dev
-      - libusbredirparser-dev
-      - libvde-dev
-      - libvdeplug-dev
-      - libvte-2.91-dev
-      - libxml2-dev
-      - libx11-dev
-      - libzstd-dev
-      - ninja-build
-      - zlib1g-dev
-    stage-packages:
-      - libepoxy0
-      - libvte-2.91-0
-      - libsndio7.0
-      - libaio1t64
-      - libasn1-8-heimdal
-      - libboost-iostreams1.74.0
-      - libboost-thread1.74.0
-      - libbrlapi0.8
-      - libcurl3-gnutls
-      - libfdt1
-      - libgfapi0
-      - libgfrpc0
-      - libgfxdr0
-      - libgssapi3-heimdal
-      - libhcrypto5t64-heimdal
-      - libheimbase1-heimdal
-      - libheimntlm0-heimdal
-      - libhx509-5-heimdal
-      - libibverbs1
-      - libiscsi7
-      - libjemalloc2
-      - libkrb5-26-heimdal
-      - libnfs14
-      - libnghttp2-14
-      - libnuma1
-      - librados2
-      - librbd1
-      - librdmacm1
-      - libroken19-heimdal
-      - librtmp1
-      - libsasl2-2
-      - libsdl2-2.0-0
-      - libsdl2-image-2.0-0
-      - libsnappy1v5
-      - libspice-server1
-      - libtirpc3
-      - liburcu8
-      - libusb-1.0-0
-      - libusbredirhost1
-      - libusbredirparser1
-      - libvdeplug2
-      - libwind0-heimdal
-      - seabios
-    organize:
-      lib/: external/qemu/lib/
-      usr/bin/: external/qemu/bin/
-      usr/lib/: external/qemu/lib/
-      usr/local/bin/: external/qemu/bin/
-      usr/local/lib/: external/qemu/lib/
-      usr/local/libexec/: external/qemu/bin/
-      usr/local/share/: external/qemu/share/

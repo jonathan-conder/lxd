@@ -1,0 +1,54 @@
+From fe33fe916f3fe47b5c2c8cc5fecde92b04da2054 Mon Sep 17 00:00:00 2001
+From: builder <builder@localhost>
+Date: Wed, 25 Nov 2026 10:12:30 +1300
+Subject: [PATCH] UBUNTU: [Packaging] add amd64 rocm-virtio flavour
+
+Build the ROCm virtio-gpu guest kernel as its own flavour so that it
+installs alongside, and is distinguishable from, the stock generic kernel.
+The configuration is inherited from the amd64 annotations unchanged.
+---
+ debian.master/config/annotations         | 2 +-
+ debian.master/control.d/vars.rocm-virtio | 5 +++++
+ debian.master/rules.d/amd64.mk           | 2 +-
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+ create mode 100644 debian.master/control.d/vars.rocm-virtio
+
+diff --git a/debian.master/config/annotations b/debian.master/config/annotations
+index 0a9487630..52f4bace0 100644
+--- a/debian.master/config/annotations
++++ b/debian.master/config/annotations
+@@ -1,7 +1,7 @@
+ # Menu: HEADER
+ # FORMAT: 4
+ # ARCH: amd64 arm64 armhf ppc64el riscv64 s390x
+-# FLAVOUR: amd64-generic arm64-generic arm64-generic-64k armhf-generic ppc64el-generic riscv64-generic s390x-generic
++# FLAVOUR: amd64-generic amd64-rocm-virtio arm64-generic arm64-generic-64k armhf-generic ppc64el-generic riscv64-generic s390x-generic
+ 
+ CONFIG_ACCESSIBILITY                            policy<{'amd64': 'y', 'arm64': 'y', 'armhf': 'y', 'ppc64el': 'y', 'riscv64': 'y', 's390x': 'n'}>
+ CONFIG_ACCESSIBILITY                            note<'LP: #1967702'>
+diff --git a/debian.master/control.d/vars.rocm-virtio b/debian.master/control.d/vars.rocm-virtio
+new file mode 100644
+index 000000000..8a01e727a
+--- /dev/null
++++ b/debian.master/control.d/vars.rocm-virtio
+@@ -0,0 +1,5 @@
++arch="amd64"
++supported="ROCm virtio"
++target="Geared toward VM guests using ROCm over virtio-gpu native context."
++bootloader="grub-pc [amd64] | grub-efi-amd64 [amd64] | grub-efi-ia32 [amd64] | grub [amd64] | lilo [amd64]"
++provides="kvm-api-4, redhat-cluster-modules, ivtv-modules, virtualbox-guest-modules [amd64]"
+diff --git a/debian.master/rules.d/amd64.mk b/debian.master/rules.d/amd64.mk
+index 4e4d60818..663de16ed 100644
+--- a/debian.master/rules.d/amd64.mk
++++ b/debian.master/rules.d/amd64.mk
+@@ -1,6 +1,6 @@
+ build_arch	= x86
+ defconfig	= defconfig
+-flavours	= generic
++flavours	= rocm-virtio
+ build_image	= bzImage
+ kernel_file	= arch/$(build_arch)/boot/bzImage
+ install_file	= vmlinuz
+-- 
+2.43.0
+

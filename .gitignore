@@ -30,3 +30,6 @@ doc/**/__pycache__
 
 # Workshop
 .workshop.lock
+
+# External QEMU development builds
+/lxd-qemu-snap/build/

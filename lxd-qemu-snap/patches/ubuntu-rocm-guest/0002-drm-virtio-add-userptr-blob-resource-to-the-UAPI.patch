@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Honglei Huang <honghuan@amd.com>
+Date: Fri, 6 Nov 2026 16:26:23 +0800
+Subject: [PATCH 2/4] drm/virtio: add userptr blob resource to the UAPI
+
+Add a userptr address field so userspace can request a blob backed
+by an existing process mapping. A non-zero userptr selects that
+path; probe VIRTGPU_PARAM_USERPTR before using the field.
+
+GPU-readonly backing is requested with the virtio CREATE_BLOB wire
+flag VIRTIO_GPU_BLOB_FLAG_USE_READONLY (also
+VIRTGPU_BLOB_FLAG_USE_READONLY). The device MUST NOT write such a
+resource. The guest pins without FOLL_WRITE only when the device
+advertised VIRTIO_GPU_F_BLOB_READONLY (VIRTGPU_PARAM_BLOB_READONLY).
+
+Signed-off-by: Honglei Huang <honghuan@amd.com>
+
+diff --git a/include/uapi/drm/virtgpu_drm.h b/include/uapi/drm/virtgpu_drm.h
+index 2e740fb0b..74bd696f7 100644
+--- a/include/uapi/drm/virtgpu_drm.h
++++ b/include/uapi/drm/virtgpu_drm.h
+@@ -98,6 +98,9 @@ struct drm_virtgpu_execbuffer {
+ #define VIRTGPU_PARAM_CONTEXT_INIT 6 /* DRM_VIRTGPU_CONTEXT_INIT */
+ #define VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs 7 /* Bitmask of supported capability set ids */
+ #define VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME 8 /* Ability to set debug name from userspace */
++#define VIRTGPU_PARAM_BLOB_ALIGNMENT 9 /* Device alignment requirements for blobs */
++#define VIRTGPU_PARAM_USERPTR 10 /* CREATE_BLOB userptr field is supported */
++#define VIRTGPU_PARAM_BLOB_READONLY 11 /* VIRTGPU_BLOB_FLAG_USE_READONLY is honored */
+ 
+ struct drm_virtgpu_getparam {
+ 	__u64 param;
+@@ -186,6 +189,7 @@ struct drm_virtgpu_resource_create_blob {
+ #define VIRTGPU_BLOB_FLAG_USE_MAPPABLE     0x0001
+ #define VIRTGPU_BLOB_FLAG_USE_SHAREABLE    0x0002
+ #define VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
++#define VIRTGPU_BLOB_FLAG_USE_READONLY     0x0008
+ 	/* zero is invalid blob_mem */
+ 	__u32 blob_mem;
+ 	__u32 blob_flags;
+@@ -201,6 +205,12 @@ struct drm_virtgpu_resource_create_blob {
+ 	__u32 cmd_size;
+ 	__u64 cmd;
+ 	__u64 blob_id;
++	/*
++	 * Non-zero selects the userptr path and is valid only with
++	 * VIRTGPU_BLOB_MEM_GUEST. Must be 0 otherwise. Probe
++	 * VIRTGPU_PARAM_USERPTR before using this field.
++	 */
++	__u64 userptr;
+ };
+ 
+ #define VIRTGPU_CONTEXT_PARAM_CAPSET_ID       0x0001
+diff --git a/include/uapi/linux/virtio_gpu.h b/include/uapi/linux/virtio_gpu.h
+index e869d17c5..7e939515e 100644
+--- a/include/uapi/linux/virtio_gpu.h
++++ b/include/uapi/linux/virtio_gpu.h
+@@ -64,6 +64,14 @@
+  * context_init and multiple timelines
+  */
+ #define VIRTIO_GPU_F_CONTEXT_INIT        4
++/*
++ * Device alignment requirements for blob backing.
++ */
++#define VIRTIO_GPU_F_BLOB_ALIGNMENT      5
++/*
++ * VIRTIO_GPU_BLOB_FLAG_USE_READONLY
++ */
++#define VIRTIO_GPU_F_BLOB_READONLY       6
+ 
+ enum virtio_gpu_ctrl_type {
+ 	VIRTIO_GPU_UNDEFINED = 0,
+@@ -406,6 +414,7 @@ struct virtio_gpu_resource_create_blob {
+ #define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE     0x0001
+ #define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE    0x0002
+ #define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
++#define VIRTIO_GPU_BLOB_FLAG_USE_READONLY     0x0008
+ 	/* zero is invalid blob mem */
+ 	__le32 blob_mem;
+ 	__le32 blob_flags;
+-- 
+2.43.0
+

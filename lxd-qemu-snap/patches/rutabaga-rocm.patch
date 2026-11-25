@@ -1,0 +1,25 @@
+diff --git a/ffi/src/include/rutabaga_gfx_ffi.h b/ffi/src/include/rutabaga_gfx_ffi.h
+index 7efc12f..515dd86 100644
+--- a/ffi/src/include/rutabaga_gfx_ffi.h
++++ b/ffi/src/include/rutabaga_gfx_ffi.h
+@@ -41,6 +41,7 @@ extern "C" {
+ #define RUTABAGA_CAPSET_GFXSTREAM_MAGMA 7
+ #define RUTABAGA_CAPSET_GFXSTREAM_GLES 8
+ #define RUTABAGA_CAPSET_GFXSTREAM_COMPOSER 9
++#define RUTABAGA_CAPSET_ROCM 10
+ 
+ /**
+  * Blob resource creation parameters.
+diff --git a/src/rutabaga_utils.rs b/src/rutabaga_utils.rs
+index 11e22c4..b497abd 100644
+--- a/src/rutabaga_utils.rs
++++ b/src/rutabaga_utils.rs
+@@ -386,7 +386,7 @@ const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+ const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
+ const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+ const VIRGLRENDERER_DRM: u32 = 1 << 10;
+-const VIRGLRENDERER_ROCM: u32 = 1 << 14;
++const VIRGLRENDERER_ROCM: u32 = 1 << 15;
+ 
+ /// virglrenderer flag struct.
+ #[derive(Copy, Clone)]

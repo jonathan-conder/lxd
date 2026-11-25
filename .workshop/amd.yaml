@@ -1,0 +1,10 @@
+name: amd
+base: ubuntu@26.04
+sdks:
+  - name: project-amd-tools
+
+actions:
+  build-kernel: |
+    make -C lxd-qemu-snap -f Makefile.amd kernel
+  build-rocr: |
+    make -C lxd-qemu-snap -f Makefile.amd rocr

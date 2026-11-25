@@ -1,0 +1,24 @@
+#!/bin/bash
+set -eu
+
+export DEBIAN_FRONTEND=noninteractive
+
+sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+apt-get update
+apt-get build-dep -y linux
+apt-get install -y --no-install-recommends fakeroot git
+
+# ROCr: gfx1250 shaders need LLVM 22, image blits need ROCm device libraries.
+apt-get install -y --no-install-recommends \
+    clang-22 \
+    cmake \
+    libclang-22-dev \
+    libdrm-dev \
+    libelf-dev \
+    libnuma-dev \
+    lld-22 \
+    llvm-22-dev \
+    ninja-build \
+    pkg-config \
+    rocm-device-libs-21 \
+    xxd
